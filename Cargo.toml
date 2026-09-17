@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/et-proto",
+    "crates/et-server",
 ]
 
 [workspace.package]
@@ -15,6 +16,7 @@ repository = "https://github.com/MisterTea/EternalTerminal"
 # committed Cargo.lock makes the build reproducible regardless.
 [workspace.dependencies]
 et-proto = { path = "crates/et-proto", version = "0.1.0" }
+et-server = { path = "crates/et-server", version = "0.1.0" }
 prost = "=0.14.4"
 crypto_secretbox = "=0.1.1"
 thiserror = "2"
