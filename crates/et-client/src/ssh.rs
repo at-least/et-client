@@ -1,0 +1,250 @@
+//! SSH handshake helpers, faithful to upstream `SshSetupHandler.cpp`.
+//!
+//! Everything here is **pure** — no process is spawned, no trait must be
+//! implemented — so conch can drive the handshake over its own SSH
+//! transport (russh): build the command string, run it remotely, feed the
+//! collected output back into [`parse_idpasskey_output`]. The `et` CLI does
+//! exactly this with the system `ssh` binary ([`run_ssh_handshake`]).
+
+use crate::protocol::DEFAULT_TERMINAL;
+use et_proto::ids::{ID_LEN, PASSKEY_LEN};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdPasskey {
+    pub id: String,
+    pub passkey: String,
+}
+
+/// Marker the server-side `etterminal` prints on stdout (upstream
+/// `TerminalMain.cpp`: `CLOG(INFO, "stdout") << "IDPASSKEY:" << idpasskey`).
+pub const IDPASSKEY_MARKER: &str = "IDPASSKEY:";
+
+/// Options for the remote `etterminal` command line. Only fields the upstream
+/// client actually varies for a plain terminal session.
+#[derive(Debug, Clone, Default)]
+pub struct TerminalCommandOptions {
+    /// `--verbose=N` (upstream always passes it).
+    pub verbose: i32,
+    /// `--serverfifo=PATH` override, mirrors upstream `--serverfifo`.
+    pub server_fifo: Option<String>,
+    /// `cmd_prefix` upstream: full path to the etterminal binary (empty =
+    /// `etterminal` on `$PATH`).
+    pub etterminal_path: String,
+    /// Upstream `--kill`: `pkill etterminal -u <user>; sleep 0.5;` prefix.
+    pub kill_existing: bool,
+    /// Remote user for the `pkill -u` part of `--kill`.
+    pub user: String,
+}
+
+/// Builds `echo '<id>/<passkey>_<TERM>' | etterminal --verbose=N ...`,
+/// byte-identical to upstream `genCommand` (quoting included — upstream does
+/// not escape, and neither do we; the id/passkey alphabet is shell-safe).
+pub fn etterminal_command(
+    id: &str,
+    passkey: &str,
+    client_term: &str,
+    opts: &TerminalCommandOptions,
+) -> String {
+    let bin = if opts.etterminal_path.is_empty() {
+        "etterminal"
+    } else {
+        &opts.etterminal_path
+    };
+    let mut command =
+        format!("echo '{id}/{passkey}_{client_term}' | {bin} --verbose={}", opts.verbose);
+    if let Some(fifo) = &opts.server_fifo {
+        command.push_str(&format!(" --serverfifo={fifo}"));
+    }
+    if opts.kill_existing {
+        let user = if opts.user.is_empty() { "$USER" } else { &opts.user };
+        command = format!("pkill etterminal -u {user}; sleep 0.5; {command}");
+    }
+    command
+}
+
+/// Upstream `SshSetupHandler::SetupSsh`: new clients send an id starting
+/// with `XXX` so a modern server regenerates both values.
+pub fn generate_id_passkey() -> IdPasskey {
+    let (id, passkey) = et_proto::ids::generate_id_passkey();
+    IdPasskey { id, passkey }
+}
+
+/// `$TERM` default for the remote shell (upstream: `xterm-256color`).
+pub fn default_client_term() -> String {
+    std::env::var("TERM").unwrap_or_else(|_| DEFAULT_TERMINAL.to_string())
+}
+
+/// Destination for [`build_ssh_args`].
+#[derive(Debug, Clone, Default)]
+pub struct SshDestination {
+    pub user: String,
+    pub host: String,
+    pub port: Option<u16>,
+    /// `--jumphost` value upstream (`-J`); jump support is not implemented in
+    /// this port yet, the field is carried for CLI compatibility.
+    pub jumphost: Option<String>,
+    /// Extra `-o` options (upstream `--ssh-option`).
+    pub ssh_options: Vec<String>,
+}
+
+/// Builds the `ssh` argv (without the program name): `[-J jumphost]
+/// [user@]host [-p port] [-o opt]... <command>`. Mirrors
+/// `SshSetupHandler::SetupSsh` ordering.
+pub fn build_ssh_args(dest: &SshDestination, command: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(jump) = &dest.jumphost {
+        args.push("-J".into());
+        args.push(jump.clone());
+    }
+    let mut target = String::new();
+    if !dest.user.is_empty() {
+        target.push_str(&dest.user);
+        target.push('@');
+    }
+    target.push_str(&dest.host);
+    args.push(target);
+    if let Some(port) = dest.port {
+        args.push("-p".into());
+        args.push(port.to_string());
+    }
+    for opt in &dest.ssh_options {
+        args.push(format!("-o{opt}"));
+    }
+    args.push(command.to_string());
+    args
+}
+
+/// Extracts the (possibly server-regenerated) id/passkey from the collected
+/// ssh output. Upstream searches for `"IDPASSKEY:"` anywhere in the buffer
+/// and takes exactly `16 + 1 + 32` characters after the marker — everything
+/// before it may be noise from login scripts.
+pub fn parse_idpasskey_output(output: &str) -> Option<IdPasskey> {
+    let start = output.find(IDPASSKEY_MARKER)? + IDPASSKEY_MARKER.len();
+    let rest = &output[start..];
+    if rest.len() < ID_LEN + 1 + PASSKEY_LEN {
+        return None;
+    }
+    let idpasskey = &rest[..ID_LEN + 1 + PASSKEY_LEN];
+    let (id, passkey) = idpasskey.split_once('/')?;
+    Some(IdPasskey { id: id.to_string(), passkey: passkey.to_string() })
+}
+
+/// Error of [`run_ssh_handshake`].
+#[derive(Debug, thiserror::Error)]
+pub enum SshHandshakeError {
+    #[error("ssh exited unsuccessfully")]
+    SshFailed,
+    #[error("no IDPASSKEY in server output (is anything printed in the server shell rc files?)")]
+    MissingMarker,
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Runs the handshake with the system `ssh`: stdout is piped (that is where
+/// `IDPASSKEY:` arrives), stdin and stderr stay attached so interactive
+/// host-key/password prompts keep working — the same split as upstream
+/// `SubprocessToStringInteractive`.
+pub async fn run_ssh_handshake(
+    dest: &SshDestination,
+    command: &str,
+) -> Result<IdPasskey, SshHandshakeError> {
+    let args = build_ssh_args(dest, command);
+    let output = tokio::process::Command::new("ssh")
+        .args(&args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .await?;
+    if !output.status.success() && output.stdout.is_empty() {
+        return Err(SshHandshakeError::SshFailed);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_idpasskey_output(&text).ok_or(SshHandshakeError::MissingMarker)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_ids_have_upstream_shape() {
+        const ALPHANUM: &[u8; 62] =
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        for _ in 0..32 {
+            let ip = generate_id_passkey();
+            assert_eq!(ip.id.len(), ID_LEN);
+            assert_eq!(&ip.id[..3], "XXX");
+            assert_eq!(ip.passkey.len(), PASSKEY_LEN);
+            assert!(
+                ip.id.bytes().all(|b| ALPHANUM.contains(&b))
+                    && ip.passkey.bytes().all(|b| ALPHANUM.contains(&b))
+            );
+        }
+    }
+
+    #[test]
+    fn command_matches_upstream_format() {
+        let opts = TerminalCommandOptions::default();
+        assert_eq!(
+            etterminal_command("XXXabc", "key123", "xterm-256color", &opts),
+            "echo 'XXXabc/key123_xterm-256color' | etterminal --verbose=0"
+        );
+        let opts = TerminalCommandOptions {
+            verbose: 3,
+            server_fifo: Some("/tmp/fifo".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            etterminal_command("i", "p", "t", &opts),
+            "echo 'i/p_t' | etterminal --verbose=3 --serverfifo=/tmp/fifo"
+        );
+        let opts = TerminalCommandOptions {
+            kill_existing: true,
+            user: "joe".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            etterminal_command("i", "p", "t", &opts),
+            "pkill etterminal -u joe; sleep 0.5; echo 'i/p_t' | etterminal --verbose=0"
+        );
+    }
+
+    #[test]
+    fn parse_idpasskey_finds_marker_after_noise() {
+        let ip = generate_id_passkey();
+        let output = format!(
+            "Last login: today\nsome motd\nIDPASSKEY:{}/{}",
+            ip.id, ip.passkey
+        );
+        assert_eq!(parse_idpasskey_output(&output).unwrap(), ip);
+        // Marker absent (login shell printed something else).
+        assert!(parse_idpasskey_output("hello world").is_none());
+        // Marker present but truncated.
+        let truncated = format!("IDPASSKEY:{}/{}", ip.id, &ip.passkey[..10]);
+        assert!(parse_idpasskey_output(&truncated).is_none());
+    }
+
+    #[test]
+    fn ssh_args_match_upstream_order() {
+        let dest = SshDestination {
+            user: "me".into(),
+            host: "example.com".into(),
+            port: Some(2222),
+            jumphost: Some("jump@bastion".into()),
+            ssh_options: vec!["BatchMode=yes".into()],
+        };
+        assert_eq!(
+            build_ssh_args(&dest, "echo hi"),
+            vec![
+                "-J",
+                "jump@bastion",
+                "me@example.com",
+                "-p",
+                "2222",
+                "-oBatchMode=yes",
+                "echo hi"
+            ]
+        );
+    }
+}
