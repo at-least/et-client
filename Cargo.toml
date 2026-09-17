@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/et-proto",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/MisterTea/EternalTerminal"
+
+# Wire-format dependencies are pinned exact across the workspace (conch-core
+# practice: a byte-for-byte-pinned wire format must not drift with a dep bump).
+# Infra dependencies (tokio, nix, libc, crossterm) are semver ranges; the
+# committed Cargo.lock makes the build reproducible regardless.
+[workspace.dependencies]
+et-proto = { path = "crates/et-proto", version = "0.1.0" }
+prost = "=0.14.4"
+crypto_secretbox = "=0.1.1"
+thiserror = "2"
+getrandom = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "sync", "time", "process", "signal", "macros", "fs"] }
+nix = { version = "0.31", features = ["fs", "process", "signal", "socket", "term", "user"] }
+libc = "0.2"
+bytes = "1"
+crossterm = "0.29"
+
+[profile.release]
+lto = "thin"

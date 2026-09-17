@@ -1,0 +1,17 @@
+[package]
+name = "et-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire layer of the EternalTerminal protocol: packets, framing, crypto, protobuf messages."
+
+[dependencies]
+prost.workspace = true
+crypto_secretbox.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
