@@ -131,7 +131,15 @@ session.send_input(b"htop\n").await?;
 ```sh
 cargo test                       # unit + golden-wire + full-stack (Rust only)
 cargo test --test cpp_interop -- --ignored   # against real C++ binaries
+scripts/docker-test.sh           # the whole thing on Linux in a container
 ```
+
+`scripts/docker-test.sh` builds an Ubuntu 22.04 image with the upstream C++
+binaries (et 7.0.0 from the `jgmath2000/et` PPA — same protocol, same
+version family as the macOS verification) and runs the full suite, the C++
+interop tests, and clippy inside it. Every run doubles as the Linux build
+validation: the PTY, unix-socket, and ioctl paths are exercised on the
+platform etserver is actually deployed on.
 
 - **Golden wire tests** lock every message encoding and frame layout against
   hand-computed protobuf bytes (the upstream `.proto` files in `proto/` are
