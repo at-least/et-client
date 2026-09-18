@@ -28,6 +28,9 @@ struct Cli {
     server_fifo: Option<String>,
     forward_sources: Vec<et_proto::PortForwardSourceRequest>,
     reverse_sources: Vec<et_proto::PortForwardSourceRequest>,
+    /// `[user@]host[:etport]` of the jumphost etserver (upstream
+    /// `--jumphost`).
+    jumphost: Option<String>,
 }
 
 fn usage() -> &'static str {
@@ -46,6 +49,7 @@ fn parse_args() -> Result<Cli, String> {
     let mut positional: Option<String> = None;
     let mut forward_sources: Vec<et_proto::PortForwardSourceRequest> = Vec::new();
     let mut reverse_sources: Vec<et_proto::PortForwardSourceRequest> = Vec::new();
+    let mut jumphost: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -72,10 +76,8 @@ fn parse_args() -> Result<Cli, String> {
                     .map_err(|e| format!("-r {spec}: {e}"))?;
                 reverse_sources.extend(parsed);
             }
-            "--jumphost" | "-J" => {
-                return Err(
-                    "--jumphost: jumphost mode is not implemented in this build".into(),
-                );
+            "--jumphost" => {
+                jumphost = Some(args.next().ok_or("--jumphost needs [user@]host[:port]")?);
             }
             "--serverfifo" => server_fifo = Some(args.next().ok_or("--serverfifo needs a value")?),
             "--etterminal-path" => {
@@ -145,6 +147,7 @@ fn parse_args() -> Result<Cli, String> {
         server_fifo,
         forward_sources,
         reverse_sources,
+        jumphost,
     })
 }
 
@@ -157,34 +160,128 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let et_port = cli.et_port;
 
     // 1. SSH handshake: register (id, passkey) with a fresh etterminal.
     let fresh = ssh::generate_id_passkey();
     let mut term_opts = cli.term_opts.clone();
     term_opts.server_fifo = cli.server_fifo.clone();
-    let command = ssh::etterminal_command(
-        &fresh.id,
-        &fresh.passkey,
-        &ssh::default_client_term(),
-        &term_opts,
-    );
-    eprintln!("et: launching etterminal over ssh to {}…", cli.destination.host);
-    let idpasskey = match ssh::run_ssh_handshake(&cli.destination, &command).await {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("et: ssh handshake failed: {e}");
+
+    let idpasskey = if let Some(jump) = &cli.jumphost {
+        // Jumphost mode (upstream SshSetupHandler): the destination
+        // etterminal is launched first, through the jump host (`ssh -J`),
+        // yielding the credentials both legs share; then the jump etterminal
+        // is launched on the jumphost with `--jump --dsthost --dstport`.
+        let mut via_jump = cli.destination.clone();
+        via_jump.jumphost = Some(jump.clone());
+        let dest_command = ssh::etterminal_command(
+            &fresh.id,
+            &fresh.passkey,
+            &ssh::default_client_term(),
+            &term_opts,
+        );
+        eprintln!("et: launching etterminal on {} via jumphost…", cli.destination.host);
+        let idpasskey = match ssh::run_ssh_handshake(&via_jump, &dest_command).await {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("et: ssh handshake to destination failed: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let idpasskey = if idpasskey.id.is_empty() { fresh } else { idpasskey };
+
+        let mut jump_dest = SshDestination::default();
+        let (jump_user, jumphost_addr) = match jump.split_once('@') {
+            Some((u, h)) => (u.to_string(), h.to_string()),
+            None => (String::new(), jump.clone()),
+        };
+        jump_dest.user = jump_user;
+        let (jump_host, jump_ssh_port) = match jumphost_addr.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() => (h.to_string(), Some(p.to_string())),
+            _ => (jumphost_addr, None),
+        };
+        jump_dest.host = jump_host;
+        if let Some(p) = jump_ssh_port {
+            match p.parse::<u16>() {
+                Ok(port) => jump_dest.port = Some(port),
+                Err(_) => return std::process::ExitCode::FAILURE,
+            }
+        }
+
+        let mut jump_opts = term_opts.clone();
+        jump_opts.kill_existing = false;
+        let mut jump_command = ssh::etterminal_command(
+            &idpasskey.id,
+            &idpasskey.passkey,
+            &ssh::default_client_term(),
+            &jump_opts,
+        );
+        jump_command.push_str(&format!(
+            " --jump --dsthost={} --dstport={}",
+            cli.destination.host, cli.et_port
+        ));
+        eprintln!("et: launching etterminal --jump on jumphost…");
+        let jump_idpasskey = match ssh::run_ssh_handshake(&jump_dest, &jump_command).await {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("et: ssh handshake to jumphost failed: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        if jump_idpasskey.id != idpasskey.id {
+            eprintln!(
+                "et: jumphost credentials diverged ({} != {})",
+                jump_idpasskey.id, idpasskey.id
+            );
             return std::process::ExitCode::FAILURE;
         }
+        idpasskey
+    } else {
+        let command = ssh::etterminal_command(
+            &fresh.id,
+            &fresh.passkey,
+            &ssh::default_client_term(),
+            &term_opts,
+        );
+        eprintln!("et: launching etterminal over ssh to {}…", cli.destination.host);
+        match ssh::run_ssh_handshake(&cli.destination, &command).await {
+            Ok(x) => {
+                if x.id.is_empty() {
+                    fresh
+                } else {
+                    x
+                }
+            }
+            Err(e) => {
+                eprintln!("et: ssh handshake failed: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
     };
-    // The server may have regenerated both values (the "XXX" convention).
-    let idpasskey = if idpasskey.id.is_empty() { fresh } else { idpasskey };
 
     // 2. Connect and run the terminal session. Reverse tunnels ride the
     // INITIAL_PAYLOAD (the server binds its listeners before answering).
+    // In jumphost mode the client TCP-connects to the JUMPHOST etserver
+    // with jumphost=true; the destination etserver sees the jump relay
+    // instead of this client.
+    let connect_endpoint = match &cli.jumphost {
+        Some(jump) => {
+            let (jump_host, jump_et_port) = match jump.rsplit_once(':') {
+                Some((h, p)) if !h.is_empty() => {
+                    (h.to_string(), p.parse::<u16>().ok())
+                }
+                _ => (jump.clone(), None),
+            };
+            format!(
+                "{}:{}",
+                jump_host,
+                jump_et_port.unwrap_or(2022)
+            )
+        }
+        None => format!("{}:{}", cli.destination.host, cli.et_port),
+    };
     let payload = InitialPayload {
         reversetunnels: cli.reverse_sources.clone(),
-        jumphost: Some(false),
+        jumphost: Some(cli.jumphost.is_some()),
         environmentvariables: [(
             "ET_VERSION".to_string(),
             format!("rust-{}", env!("CARGO_PKG_VERSION")),
@@ -195,7 +292,7 @@ async fn main() -> std::process::ExitCode {
     };
 
     let mut session = match TerminalSession::start(
-        format!("{}:{et_port}", cli.destination.host),
+        connect_endpoint,
         idpasskey.id.clone(),
         &idpasskey.passkey,
         &payload,

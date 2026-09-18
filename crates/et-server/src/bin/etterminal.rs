@@ -40,13 +40,16 @@ async fn main() -> std::process::ExitCode {
                     opts.socket_path = Some(path.into());
                 }
             }
-            "--jump" | "--dsthost" | "--dstport" => {
-                eprintln!(
-                    "etterminal: jumphost mode is not implemented in this build \
-                     (upstream `--jump`); use a plain tcp relay or install upstream \
-                     etterminal on the jumphost"
-                );
-                return std::process::ExitCode::FAILURE;
+            "--jump" => opts.jump = true,
+            "--dsthost" => {
+                if let Some(host) = args.next() {
+                    opts.dsthost = host;
+                }
+            }
+            "--dstport" => {
+                if let Some(port) = args.next() {
+                    opts.dstport = port.parse().unwrap_or(0);
+                }
             }
             "-v" | "--verbose" | "--logdir" | "--logtostdout" => {
                 let _ = args.next();
@@ -54,7 +57,7 @@ async fn main() -> std::process::ExitCode {
             "-h" | "--help" => {
                 println!(
                     "echo '<id>/<passkey>_<TERM>' | etterminal [--serverfifo PATH] \
-                     [--idpasskey ID/PASSKEY] [-v LEVEL]"
+                     [--idpasskey ID/PASSKEY] [--jump --dsthost H --dstport P] [-v LEVEL]"
                 );
                 return std::process::ExitCode::SUCCESS;
             }

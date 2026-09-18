@@ -219,6 +219,129 @@ async fn handle_tcp(router: Router, mut stream: TcpStream) {
     }
 }
 
+/// `TerminalServer::runJumpHost`: answer `INITIAL_RESPONSE`, hand the
+/// client's `InitialPayload` to the jump etterminal as `JUMPHOST_INIT`,
+/// then relay **packets verbatim** between the client TCP leg and the
+/// terminal unix leg (both directions; no header filtering — the jump
+/// etterminal terminates them against the destination etserver). No PF
+/// engine: PF frames relay through to the destination etserver, which
+/// owns them, exactly like upstream.
+#[allow(clippy::too_many_arguments)]
+async fn run_jump_session(
+    router: Router,
+    id: String,
+    key: String,
+    conn: BackedHandle,
+    mut events: tokio::sync::mpsc::Receiver<BackedEvent>,
+    payload: InitialPayload,
+) {
+    let cleanup = |router: &Router, id: &str, conn: &BackedHandle| {
+        router.remove_client(id);
+        let conn = conn.clone();
+        tokio::spawn(async move { conn.shutdown().await });
+    };
+
+    // Upstream answers INITIAL_RESPONSE before the terminal lookup and
+    // before JUMPHOST_INIT.
+    let response = et_proto::InitialResponse { error: None, ..Default::default() };
+    if conn
+        .write(et_packet_type::INITIAL_RESPONSE, response.encode_to_vec())
+        .await
+        .is_err()
+    {
+        cleanup(&router, &id, &conn);
+        return;
+    }
+
+    let (terminal_info, mut unix) = match router.take_terminal(&id) {
+        Some(slot) => slot,
+        None => {
+            eprintln!("etserver: no terminal registered for {id}; dropping jump session");
+            cleanup(&router, &id, &conn);
+            return;
+        }
+    };
+    if !crate::router::verify_passkey(&key, &terminal_info.passkey) {
+        eprintln!("etserver: passkey mismatch for {id} (jump)");
+        cleanup(&router, &id, &conn);
+        return;
+    }
+
+    let init = Packet::new(terminal_packet_type::JUMPHOST_INIT, payload.encode_to_vec());
+    if write_packet_frame(&mut unix, &init).await.is_err() {
+        cleanup(&router, &id, &conn);
+        return;
+    }
+
+    let (mut unix_read, mut unix_write) = unix.split();
+    let mut chunk = [0u8; TERMINAL_CHUNK];
+    // Incremental i64-framed packet decoder for the unix leg (frames can
+    // split across or coalesce in reads).
+    let mut inbuf: Vec<u8> = Vec::new();
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                // Every packet relays verbatim: in jump mode the destination
+                // etserver owns the terminal protocol, and KEEP_ALIVE echoes
+                // come back from it through the whole chain.
+                Some(BackedEvent::Packet(packet)) => {
+                    if write_packet_frame(&mut unix_write, &packet).await.is_err() {
+                        break;
+                    }
+                }
+                Some(BackedEvent::SocketDown) => {
+                    // Client offline; the relay keeps its state and the
+                    // destination leg keeps running (upstream: jumpclient
+                    // idle timeout closes it, router traffic reconnects).
+                }
+                Some(BackedEvent::Dead(_)) | None => break,
+            },
+            read = unix_read.read(&mut chunk) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    inbuf.extend_from_slice(&chunk[..n]);
+                    loop {
+                        match try_parse_packet_frame(&mut inbuf) {
+                            Some(Ok(packet)) => {
+                                if conn.write(packet.header(), packet.into_payload()).await.is_err() {
+                                    // peer gone; the terminal will EOF us
+                                }
+                            }
+                            Some(Err(e)) => {
+                                eprintln!("etserver: jump session {id} bad frame: {e}");
+                                return;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            },
+        }
+    }
+    eprintln!("etserver: jump session {id} ended");
+    cleanup(&router, &id, &conn);
+}
+
+/// Incremental `i64`-LE framed packet parser: `None` = need more bytes,
+/// `Some(Ok(_))` = one packet (consumed from the buffer), `Some(Err(_))` =
+/// unrecoverable frame error (buffer drained).
+fn try_parse_packet_frame(buf: &mut Vec<u8>) -> Option<Result<Packet, String>> {
+    if buf.len() < 8 {
+        return None;
+    }
+    let len = i64::from_le_bytes(buf[..8].try_into().ok()?);
+    if !(0..=DEFAULT_MAX_PROTO_LENGTH).contains(&len) {
+        buf.clear();
+        return Some(Err(format!("invalid jump frame length {len}")));
+    }
+    let total = 8 + len as usize;
+    if buf.len() < total {
+        return None;
+    }
+    let bytes: Vec<u8> = buf.drain(..total).collect();
+    Some(Packet::parse(&bytes[8..]).ok_or_else(|| "bad jump packet".to_string()))
+}
+
 /// `TerminalServer::handleConnection` + `runTerminal`: the relay between
 /// one client connection and its terminal.
 async fn run_session(
@@ -251,16 +374,7 @@ async fn run_session(
         }
     };
     if payload.jumphost == Some(true) {
-        // Jump mode is not implemented in this port.
-        let response = et_proto::InitialResponse {
-            error: Some("jumphost mode is not supported by this etserver build".into()),
-            ..Default::default()
-        };
-        let _ = conn
-            .write(et_packet_type::INITIAL_RESPONSE, response.encode_to_vec())
-            .await;
-        eprintln!("etserver: client {id} requested jumphost mode; refusing");
-        cleanup(&router, &id, &conn);
+        run_jump_session(router, id, key, conn, events, payload).await;
         return;
     }
 

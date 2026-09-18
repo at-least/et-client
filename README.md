@@ -161,10 +161,30 @@ Unix-socket forwarding (`ENV:/path`, SSH agent) is not supported — the parser
 accepts those forms but the CLI and engine reject them with a clear error.
 Interop tests cover both directions against the C++ etserver.
 
+## Jumphost
+
+`et --jumphost [user@]jump:2022 user@dest -c …` implements the upstream
+topology end to end:
+
+```
+et client → jumphost etserver:2022 → etterminal --jump → destination etserver → etterminal(PTY)
+```
+
+The destination etterminal is launched first (over `ssh -J jump`), yielding
+the credentials both legs share; the jump etterminal is launched second with
+`--jump --dsthost --dstport`; the client then TCP-connects to the **jumphost**
+etserver with `jumphost=true` in its `INITIAL_PAYLOAD`. The jumphost etserver
+hands the payload to its jump etterminal as `JUMPHOST_INIT`, which opens a
+resilient `EtClient` connection to the destination etserver and relays packets
+hop by hop (each leg decrypts and re-encrypts; the destination etserver owns
+the terminal protocol and the keepalive echoes). Port forwarding works through
+the chain — PF frames relay to the destination etserver, which owns them, so
+`-t`/`-r` combine with `--jumphost`.
+
 ## Not implemented (deliberately)
 
-- **Jumphost** (`--jump` mode): refused by the CLI and etterminal. Upstream
-  compatibility of the *terminal* path is unaffected.
+- **Unix-socket forwarding** (`ENV:/path`, SSH agent): parsed like upstream,
+  rejected with a clear error; TCP port forwarding is fully supported.
 - Windows. The unix leg and PTY layer are unix-only by design.
 - Upstream's `et.cfg` INI file (flags cover `--port`/`--serverfifo`).
 - Cosmetic divergences (documented in code): output rate limiting

@@ -12,6 +12,11 @@
 //! - server→terminal frames are `[type: u8][i64-LE framed proto]`;
 //!   terminal→server output is a raw byte stream.
 
+/// Re-export of the shared client event type used by the jump relay.
+pub mod client_event_shim {
+    pub use et_proto::client::Event;
+}
+
 pub mod fifo;
 pub mod pty;
 pub mod router;

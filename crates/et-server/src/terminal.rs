@@ -14,16 +14,20 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use std::os::fd::{AsRawFd, RawFd};
 
 use et_proto::framing::{read_packet_frame, read_proto_frame, write_packet_frame};
 use et_proto::{TerminalBuffer, TerminalInfo, TerminalUserInfo};
 use buffa::Message as _;
+use et_proto::client::EtClient;
+use et_proto::framing::try_parse_packet_frame_from_buffer;
 use et_proto::{Packet, DEFAULT_MAX_PROTO_LENGTH, terminal_packet_type};
-use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt, unix::AsyncFd};
 use tokio::net::UnixStream;
 
+use crate::client_event_shim::Event;
 use crate::ServerError;
 
 pub const IDPASSKEY_MARKER: &str = "IDPASSKEY:";
@@ -45,6 +49,12 @@ pub struct TerminalOptions {
     /// points the shell at an empty home so no profile noise pollutes the
     /// stream.
     pub home: Option<std::path::PathBuf>,
+    /// Jumphost mode (upstream `--jump`): after `JUMPHOST_INIT`, relay
+    /// packets to `dsthost:dstport` (the destination etserver) instead of
+    /// hosting a PTY.
+    pub jump: bool,
+    pub dsthost: String,
+    pub dstport: u16,
 }
 
 /// Runs the etterminal role to completion. The caller exits afterwards (the
@@ -79,6 +89,15 @@ pub async fn run(opts: TerminalOptions) -> Result<(), ServerError> {
     // the marker; nothing else may follow on this line).
     println!("{IDPASSKEY_MARKER}{id}/{passkey}");
     std::io::stdout().flush().ok();
+
+    if opts.jump {
+        if opts.dsthost.is_empty() || opts.dstport == 0 {
+            return Err(ServerError::Other(
+                "jump mode requires --dsthost and --dstport".into(),
+            ));
+        }
+        return run_jump(id, passkey, opts.dsthost.clone(), opts.dstport, stream).await;
+    }
 
     // Wait for TERMINAL_INIT carrying the session environment.
     let init_packet =
@@ -297,4 +316,122 @@ fn raw_write(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
         }
         return Ok(n as usize);
     }
+}
+
+/// Jumphost relay (upstream `UserJumphostHandler::run`): wait for
+/// `JUMPHOST_INIT` carrying the client's `InitialPayload`, clear the
+/// jumphost flag, open a resilient client connection to the destination
+/// etserver, send the payload there, then relay packets verbatim between
+/// the local unix leg and the destination TCP leg. The same id/passkey is
+/// used on both legs, so every hop decrypts and re-encrypts in step.
+async fn run_jump(
+    id: String,
+    passkey: String,
+    dsthost: String,
+    dstport: u16,
+    mut stream: UnixStream,
+) -> Result<(), ServerError> {
+    let init_packet = read_expected_packet(&mut stream, et_proto::terminal_packet_type::JUMPHOST_INIT)
+        .await
+        .map_err(|e| {
+            eprintln!("etterminal: waiting for JUMPHOST_INIT failed: {e}");
+            e
+        })?;
+    let mut payload = et_proto::InitialPayload::decode_from_slice(&init_packet)
+        .map_err(|e| ServerError::Other(format!("bad InitialPayload: {e}")))?;
+    if payload.jumphost != Some(true) {
+        return Err(ServerError::Other("jumphost init without jumphost flag".into()));
+    }
+    payload.jumphost = Some(false);
+
+    let mut jump = EtClient::connect_with(
+        format!("{dsthost}:{dstport}"),
+        id.clone(),
+        &passkey,
+        None, // idle handling belongs to the relay, not keepalive probes
+    )
+    .await
+    .map_err(|e| ServerError::Other(format!("connect to destination etserver: {e}")))?;
+    use buffa::Message as _;
+    use et_proto::et_packet_type;
+    jump.write(et_packet_type::INITIAL_PAYLOAD, payload.encode_to_vec())
+        .await
+        .map_err(|_| ServerError::Other("destination leg closed".into()))?;
+    // Wait for a successful INITIAL_RESPONSE from the destination.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ServerError::Other(
+                "timeout waiting for destination INITIAL_RESPONSE".into(),
+            ));
+        }
+        match tokio::time::timeout(Duration::from_secs(2), jump.next_event()).await {
+            Ok(Some(et_proto::client::Event::Packet(p))) => {
+                if p.header() == et_packet_type::INITIAL_RESPONSE {
+                    let response = et_proto::InitialResponse::decode_from_slice(p.payload())
+                        .map_err(|e| ServerError::Other(format!("bad InitialResponse: {e}")))?;
+                    if let Some(error) = response.error {
+                        return Err(ServerError::Other(format!(
+                            "destination refused session: {error}"
+                        )));
+                    }
+                    break;
+                }
+            }
+            Ok(Some(et_proto::client::Event::Dead(_))) | Ok(None) => {
+                return Err(ServerError::Other("destination leg died during init".into()));
+            }
+            Err(_) => {}
+        }
+    }
+    eprintln!("etterminal: jump relay to {dsthost}:{dstport} established");
+
+    // Relay: unix leg (i64-framed packets, both directions) ↔ destination
+    // client connection (decrypted packets). Every packet terminates at
+    // this hop; each leg has its own nonce stream over the shared key.
+    let (mut unix_read, mut unix_write) = stream.split();
+    let mut inbuf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        tokio::select! {
+            // destination → local etserver
+            event = jump.next_event() => match event {
+                Some(Event::Packet(packet)) => {
+                    if write_packet_frame(&mut unix_write, &packet).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Event::Dead(_)) | None => break,
+            },
+            // local etserver → destination
+            read = unix_read.read(&mut chunk) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    inbuf.extend_from_slice(&chunk[..n]);
+                    loop {
+                        match try_parse_packet_frame_from_buffer(&mut inbuf) {
+                            Some(Ok(packet)) => {
+                                let header = packet.header();
+                                let payload = packet.into_payload();
+                                if jump.write(header, payload).await.is_err() {
+                                    return Err(ServerError::Other(
+                                        "destination leg closed".into(),
+                                    ));
+                                }
+                            }
+                            Some(Err(e)) => {
+                                return Err(ServerError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    e.to_string(),
+                                )));
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            },
+        }
+    }
+    jump.shutdown().await;
+    Ok(())
 }

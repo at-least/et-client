@@ -53,7 +53,7 @@ pub async fn read_proto_frame<R: AsyncRead + Unpin>(
         Err(e) => return Err(FrameError::map_io(e)),
     }
     let len = i64::from_le_bytes(len_buf);
-    if len < 0 || len > max_len {
+    if !(0..=max_len).contains(&len) {
         return Err(FrameError::InvalidLength(len));
     }
     let mut buf = vec![0u8; len as usize];
@@ -143,6 +143,38 @@ pub async fn write_unframed<W: AsyncWrite + Unpin>(
 ) -> Result<(), FrameError> {
     w.write_all(bytes).await?;
     Ok(())
+}
+
+/// Incremental variant of [`read_proto_frame`] for byte-stream buffers:
+/// pulls one `i64`-LE framed message out of `buf` in place. Returns `None`
+/// when more bytes are needed. Malformed frames drain the buffer and yield
+/// `Some(Err(...))`.
+pub fn try_parse_proto_frame(buf: &mut Vec<u8>) -> Option<Result<Vec<u8>, FrameError>> {
+    if buf.len() < 8 {
+        return None;
+    }
+    let len = i64::from_le_bytes(buf[..8].try_into().ok()?);
+    if !(0..=128 * 1024 * 1024).contains(&len) {
+        buf.clear();
+        return Some(Err(FrameError::InvalidLength(len)));
+    }
+    let total = 8 + len as usize;
+    if buf.len() < total {
+        return None;
+    }
+    let bytes: Vec<u8> = buf.drain(..total).collect();
+    Some(Ok(bytes[8..].to_vec()))
+}
+
+/// [`try_parse_proto_frame`] for full packets (unix-leg jump relay).
+pub fn try_parse_packet_frame_from_buffer(
+    buf: &mut Vec<u8>,
+) -> Option<Result<crate::packet::Packet, FrameError>> {
+    match try_parse_proto_frame(buf) {
+        None => None,
+        Some(Err(e)) => Some(Err(e)),
+        Some(Ok(bytes)) => Some(crate::packet::Packet::parse(&bytes).ok_or(FrameError::InvalidPacket)),
+    }
 }
 
 #[cfg(test)]

@@ -385,6 +385,91 @@ async fn reverse_tunnel_through_cpp_server() {
     pump.abort();
 }
 
+/// The full upstream jump topology with mixed implementations:
+/// Rust client → **C++ etserver (jump)** → **Rust etterminal --jump** →
+/// **C++ etserver (destination)** → **C++ etterminal** (PTY). Validates the
+/// jump relay's unix registration, JUMPHOST_INIT handling, destination
+/// ClientConnection, and the client leg against C++ `runJumpHost`.
+#[tokio::test]
+#[ignore = "requires the C++ binaries (brew install et); run with --ignored"]
+async fn jumphost_chain_with_cpp_servers() {
+    let _guard = INTEROP.lock().await;
+    let dir = unique_dir("cpp-jump");
+
+    // Destination: C++ etserver + C++ etterminal (regenerates credentials).
+    let dest = start_cpp_stack().await;
+    let (dest_port, dest_id, dest_passkey) =
+        (dest.port, dest.id.clone(), dest.passkey.clone());
+
+    // Jump: C++ etserver (its own fifo/port).
+    let jump_fifo = dir.join("jump.sock");
+    let jump_port = free_port();
+    let etserver = cpp_bin("etserver").unwrap();
+    let mut jump_server = tokio::process::Command::new(&etserver)
+        .arg("--port")
+        .arg(jump_port.to_string())
+        .arg("--serverfifo")
+        .arg(&jump_fifo)
+        .env("HOME", &dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", jump_port)).await.is_ok() {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "C++ jump etserver never listened");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Rust etterminal --jump on the jumphost, registering the DESTINATION
+    // credentials (exactly what upstream's two-ssh handshake produces).
+    tokio::spawn(et_server::terminal::run(et_server::terminal::TerminalOptions {
+        idpasskey: Some((dest_id.clone(), dest_passkey.clone())),
+        term: Some("xterm-256color".into()),
+        socket_path: Some(jump_fifo.clone()),
+        shell: Some("/bin/sh".into()),
+        home: Some(dir.clone()),
+        jump: true,
+        dsthost: "127.0.0.1".into(),
+        dstport: dest_port,
+    }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let payload = InitialPayload { jumphost: Some(true), ..Default::default() };
+    let mut session = TerminalSession::start(
+        format!("127.0.0.1:{jump_port}"),
+        dest_id.clone(),
+        &dest_passkey,
+        &payload,
+        DEFAULT_KEEPALIVE,
+    )
+    .await
+    .expect("jump chain handshake (Rust client → C++ jump etserver)");
+    session.send_terminal_info(24, 80, 0, 0).await.unwrap();
+
+    session.send_input(b"echo JCPP_$((4*8))\n").await.unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !String::from_utf8_lossy(&out).contains("JCPP_32") {
+        assert!(tokio::time::Instant::now() < deadline, "no JCPP_32; got {out:?}");
+        match tokio::time::timeout(Duration::from_millis(300), session.next_event()).await {
+            Ok(Some(SessionEvent::TerminalBuffer(bytes))) => out.extend_from_slice(&bytes),
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("jump chain died before echo"),
+            Err(_) => {}
+        }
+    }
+    session.send_input(b"exit\n").await.unwrap();
+    session.shutdown().await;
+    let _ = jump_server.start_kill();
+    drop(dest); // tears the destination stack down
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// C++ `etterminal` registering with the **Rust** etserver over the unix
 /// leg: the TERMINAL_USER_INFO packet and the server→terminal typed frames
 /// must agree with the C++ client of that socket.
@@ -521,6 +606,9 @@ async fn rust_etterminal_registers_with_cpp_server() {
         socket_path: Some(socket_path.clone()),
         shell: Some("/bin/sh".into()),
         home: Some(dir.clone()),
+        jump: false,
+        dsthost: String::new(),
+        dstport: 0,
     }));
     tokio::time::sleep(Duration::from_millis(500)).await;
 

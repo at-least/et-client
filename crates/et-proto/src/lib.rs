@@ -18,6 +18,7 @@
 //!   [`write_typed_proto`]).
 
 pub mod backed;
+pub mod client;
 pub mod crypto;
 pub mod forward;
 pub mod framing;

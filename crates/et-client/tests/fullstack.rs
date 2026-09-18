@@ -62,6 +62,9 @@ async fn start_stack(id: &str, passkey: &str) -> Stack {
         socket_path: Some(socket_path.clone()),
         shell: Some("/bin/sh".into()),
         home: Some(dir.clone()),
+        jump: false,
+        dsthost: String::new(),
+        dstport: 0,
     }));
 
     // Let the terminal register before the client knocks.
@@ -329,6 +332,9 @@ async fn initial_connect_retries_until_terminal_registers() {
             socket_path: Some(term_socket),
             shell: Some("/bin/sh".into()),
             home: Some(term_home),
+            jump: false,
+            dsthost: String::new(),
+            dstport: 0,
         })
         .await;
     });
@@ -427,6 +433,71 @@ fn tunnel_request(source_port: u16, destination_port: u16) -> et_proto::PortForw
         .into(),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn jumphost_chain_round_trip() {
+    // The full upstream jump topology, all Rust: client → jump etserver →
+    // etterminal --jump → destination etserver → etterminal(PTY).
+    let dir = unique_dir("jump");
+    let (id, passkey) = test_id_passkey();
+
+    // Destination stack (its own etserver + etterminal).
+    let dest = start_stack(&id, &passkey).await;
+
+    // Jump etserver + a jump-mode etterminal registering the same
+    // credentials, pointing at the destination etserver.
+    let jump_socket = dir.join("jump.sock");
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let bound = et_server::server::bind(et_server::server::ServerOptions {
+        port: 0,
+        socket_path: Some(jump_socket.clone()),
+    })
+    .await
+    .unwrap();
+    let jump_port = bound.tcp.local_addr().unwrap().port();
+    tokio::spawn(et_server::server::serve(bound, shutdown_rx));
+    tokio::spawn(et_server::terminal::run(et_server::terminal::TerminalOptions {
+        idpasskey: Some((id.clone(), passkey.clone())),
+        term: Some("xterm-256color".into()),
+        socket_path: Some(jump_socket.clone()),
+        shell: Some("/bin/sh".into()),
+        home: Some(dir.clone()),
+        jump: true,
+        dsthost: "127.0.0.1".into(),
+        dstport: dest.port,
+    }));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The client connects to the JUMPHOST etserver with jumphost=true.
+    let payload = InitialPayload {
+        jumphost: Some(true),
+        ..Default::default()
+    };
+    let mut session = TerminalSession::start(
+        format!("127.0.0.1:{jump_port}"),
+        id.clone(),
+        &passkey,
+        &payload,
+        DEFAULT_KEEPALIVE,
+    )
+    .await
+    .expect("jumphost chain handshake");
+    session.send_terminal_info(24, 80, 0, 0).await.unwrap();
+
+    session.send_input(b"echo JUMP_$((5*5))\n").await.unwrap();
+    let out = collect_until(&mut session, Duration::from_secs(15), |s| s.contains("JUMP_25"))
+        .await;
+    assert!(
+        String::from_utf8_lossy(&out).contains("JUMP_25"),
+        "no echo through jump chain: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    session.send_input(b"exit\n").await.unwrap();
+    session.shutdown().await;
+    let _ = shutdown.send(true);
+    let _ = dest.shutdown.send(true);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
