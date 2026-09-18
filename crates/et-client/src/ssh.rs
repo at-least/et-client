@@ -119,12 +119,27 @@ pub fn build_ssh_args(dest: &SshDestination, command: &str) -> Vec<String> {
 /// and takes exactly `16 + 1 + 32` characters after the marker — everything
 /// before it may be noise from login scripts.
 pub fn parse_idpasskey_output(output: &str) -> Option<IdPasskey> {
-    let start = output.find(IDPASSKEY_MARKER)? + IDPASSKEY_MARKER.len();
-    let rest = &output[start..];
-    if rest.len() < ID_LEN + 1 + PASSKEY_LEN {
+    parse_idpasskey_bytes(output.as_bytes())
+}
+
+/// Byte-level variant of [`parse_idpasskey_output`]: motd noise around the
+/// marker is arbitrary bytes, so slicing the `&str` could panic on a char
+/// boundary; the id/passkey payload itself must be ASCII.
+pub fn parse_idpasskey_bytes(output: &[u8]) -> Option<IdPasskey> {
+    let marker = IDPASSKEY_MARKER.as_bytes();
+    let mut start = None;
+    for i in 0..output.len().saturating_sub(marker.len() - 1) {
+        if &output[i..i + marker.len()] == marker {
+            start = Some(i + marker.len());
+            break;
+        }
+    }
+    let start = start?;
+    let end = start.checked_add(ID_LEN + 1 + PASSKEY_LEN)?;
+    if output.len() < end {
         return None;
     }
-    let idpasskey = &rest[..ID_LEN + 1 + PASSKEY_LEN];
+    let idpasskey = std::str::from_utf8(&output[start..end]).ok()?;
     let (id, passkey) = idpasskey.split_once('/')?;
     Some(IdPasskey { id: id.to_string(), passkey: passkey.to_string() })
 }
@@ -208,6 +223,18 @@ mod tests {
             etterminal_command("i", "p", "t", &opts),
             "pkill etterminal -u joe; sleep 0.5; echo 'i/p_t' | etterminal --verbose=0"
         );
+    }
+
+    #[test]
+    fn parse_idpasskey_survives_non_ascii_noise() {
+        // Multibyte bytes directly around the marker must not panic (the
+        // old &str slicing did) and must not swallow the payload.
+        let ip = generate_id_passkey();
+        let mut noisy = b"\xe5\xba\x8f\x1b[0m ".to_vec();
+        noisy.extend_from_slice(format!("IDPASSKEY:{}/{}", ip.id, ip.passkey).as_bytes());
+        noisy.extend_from_slice(b" trailing \xe5\xba\x8f");
+        assert_eq!(parse_idpasskey_bytes(&noisy).unwrap(), ip);
+        assert!(parse_idpasskey_bytes(b"IDPASSKEY:\xff\xfe/xxx").is_none());
     }
 
     #[test]

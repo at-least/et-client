@@ -22,18 +22,13 @@ fn test_id_passkey() -> (String, String) {
 /// Unique temp dir per call. `pid + nanos` alone collides: the macOS clock
 /// has ~microsecond resolution and parallel tests in one process start
 /// within the same tick.
-fn unique_dir(tag: &str) -> std::path::PathBuf {
+fn unique_dir(_tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "et-{tag}-{}-{}-{n}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    // Short by construction: macOS caps sockaddr_un::sun_path at 104
+    // bytes and $TMPDIR is already ~40 of them.
+    let dir = std::env::temp_dir().join(format!("etX{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -250,6 +245,48 @@ async fn keepalive_is_echoed_while_idle() {
         }
     }
     assert!(got_keepalive, "no keepalive echo while idle; dead={dead_reason}");
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn fresh_client_cannot_resume_a_live_session() {
+    // Session A is live. A second client presenting the SAME id gets
+    // RETURNING_CLIENT on its initial connect — it must fail fast with a
+    // clear error (a fresh client's nonce phase cannot resume the stream),
+    // and session A must keep working afterwards.
+    let (id, passkey) = test_id_passkey();
+    let stack = start_stack(&id, &passkey).await;
+    let mut session = connect(&stack, &id, &passkey).await;
+    session.send_input(b"echo FIRST_$((1+1))\n").await.unwrap();
+
+    let payload = InitialPayload::default();
+    let Err(err) = TerminalSession::start(
+        format!("127.0.0.1:{}", stack.port),
+        id.clone(),
+        &passkey,
+        &payload,
+        DEFAULT_KEEPALIVE,
+    )
+    .await
+    else {
+        panic!("second client with a live id must be rejected");
+    };
+    let et_client::session::StartError::Connect(
+        et_client::ConnectFailure::Protocol(message),
+    ) = err
+    else {
+        panic!("second client with a live id was not rejected with a connect error");
+    };
+    assert!(message.contains("live session"), "unexpected error: {message}");
+
+    // Session A survived the attempt (server-side recover rolled back).
+    let out = collect_until(&mut session, Duration::from_secs(10), |s| s.contains("FIRST_2"))
+        .await;
+    assert!(
+        String::from_utf8_lossy(&out).contains("FIRST_2"),
+        "original session broken by second connect: {:?}",
+        String::from_utf8_lossy(&out)
+    );
     session.shutdown().await;
 }
 

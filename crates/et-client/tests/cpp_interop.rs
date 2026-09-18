@@ -31,21 +31,21 @@ fn cpp_bin(name: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Unique temp dir per call (see fullstack.rs for why pid+nanos collides).
-fn unique_dir(tag: &str) -> std::path::PathBuf {
+fn unique_dir(_tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "et-{tag}-{}-{}-{n}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    // Short by construction: macOS caps sockaddr_un::sun_path at 104
+    // bytes and $TMPDIR is already ~40 of them.
+    let dir = std::env::temp_dir().join(format!("etX{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+/// Serializes the interop tests: each spawns a C++ etserver on a port
+/// reserved with a bind-then-close probe, which races under parallel
+/// execution (two daemons, one port → the loser dies, the client resets).
+static INTEROP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -155,6 +155,7 @@ async fn start_cpp_stack() -> CppStack {
 #[tokio::test]
 #[ignore = "requires the C++ binaries (brew install et); run with --ignored"]
 async fn rust_client_talks_to_cpp_server() {
+    let _guard = INTEROP.lock().await;
     let stack = start_cpp_stack().await;
     let payload = InitialPayload::default();
     let mut session = TerminalSession::start(
@@ -245,6 +246,7 @@ async fn rust_client_talks_to_cpp_server() {
 #[tokio::test]
 #[ignore = "requires the C++ binaries (brew install et); run with --ignored"]
 async fn cpp_etterminal_registers_with_rust_server() {
+    let _guard = INTEROP.lock().await;
     let dir = unique_dir("cpp-reg");
     let socket_path = dir.join("etserver.sock");
 
@@ -338,6 +340,7 @@ async fn cpp_etterminal_registers_with_rust_server() {
 #[tokio::test]
 #[ignore = "requires the C++ binaries (brew install et); run with --ignored"]
 async fn rust_etterminal_registers_with_cpp_server() {
+    let _guard = INTEROP.lock().await;
     let dir = unique_dir("rust-reg");
     let socket_path = dir.join("etserver.sock");
     let port = free_port();

@@ -135,5 +135,16 @@ cargo test --test cpp_interop -- --ignored   # against real C++ binaries
 - Cosmetic divergences (documented in code): output rate limiting
   (1024 lines/s) and the Ctrl+C output-flush optimization are omitted; the
   PTY starts at 24x80 instead of 0x0 until the first resize arrives.
+- **Deliberate hardening beyond upstream** (each with a code comment): a
+  fresh client whose initial `ConnectRequest` answers `RETURNING_CLIENT`
+  fails fast with a clear error instead of wedging ~60 s (a fresh client's
+  nonce phase cannot resume a live stream); a reconnect answered
+  `NEW_CLIENT` ends the session with `ServerStateLost` instead of upstream's
+  silent infinite retry; the recover exchange is capped at 10 s (not 60) to
+  bound how long a bogus reconnect stalls the victim's writes; the initial
+  connect retries `INVALID_KEY` briefly while the freshly-launched
+  etterminal is still registering (upstream hides the race behind ssh
+  latency; a russh-driven handshake has none); the pty master is
+  `FD_CLOEXEC` so session processes cannot touch terminal traffic.
 
 Apache-2.0, matching upstream.

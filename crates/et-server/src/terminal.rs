@@ -147,6 +147,7 @@ pub async fn run(opts: TerminalOptions) -> Result<(), ServerError> {
                             info.height.unwrap_or(0),
                         );
                     }
+                    TypedFrame::Ignored => {}
                     TypedFrame::Eof => break,
                 }
             }
@@ -189,6 +190,10 @@ pub async fn run(opts: TerminalOptions) -> Result<(), ServerError> {
 enum TypedFrame {
     TerminalBuffer(Vec<u8>),
     TerminalInfo(TerminalInfo),
+    /// A type the run loop does not act on (upstream's switch simply falls
+    /// through: a second TERMINAL_INIT after a server-side session reset,
+    /// JUMPHOST_INIT, …). The body is consumed and skipped.
+    Ignored,
     Eof,
 }
 
@@ -213,7 +218,9 @@ async fn read_typed_frame(stream: &mut tokio::net::unix::ReadHalf<'_>) -> Result
                 .map_err(|e| ServerError::Other(format!("bad TerminalInfo: {e}")))?;
             Ok(TypedFrame::TerminalInfo(ti))
         }
-        other => Err(ServerError::Other(format!("unexpected frame type {other} from router"))),
+        // KEEP_ALIVE is answered by etserver, never routed here; anything
+        // else is consumed and skipped, matching upstream's default case.
+        _ => Ok(TypedFrame::Ignored),
     }
 }
 

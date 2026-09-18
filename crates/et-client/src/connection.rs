@@ -30,6 +30,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientDeadReason {
     InvalidKey,
+    /// A reconnect answered `NEW_CLIENT`: the server lost this session's
+    /// connection state (partial-connection cleanup, daemon restart) while
+    /// the key survived. The server's fresh crypto phase cannot
+    /// resynchronize with our mid-stream handlers, so the session ends;
+    /// upstream instead retries in a silent loop forever.
+    ServerStateLost,
     Other(DeadReason),
 }
 
@@ -116,7 +122,23 @@ impl EtClient {
         let key = key_bytes(passkey)
             .ok_or_else(|| ConnectFailure::Protocol("passkey must be 32 bytes".into()))?;
         let stream = match handshake_request(&endpoint, &id).await {
-            Ok(Handshake::NewClient(stream)) | Ok(Handshake::Returning(stream)) => stream,
+            Ok(Handshake::NewClient(stream)) => stream,
+            Ok(Handshake::Returning(stream)) => {
+                // `RETURNING_CLIENT` on an initial connect means a live
+                // session with its own nonce/sequence phase still exists
+                // under this id. A fresh client's handlers restart at nonce
+                // 1 while the server continues mid-stream, so resumption is
+                // impossible by construction; upstream wedges ~60 s here
+                // (its recover exchange reads our packet-framed socket as
+                // i64-framed protos) and then times out. Fail fast and
+                // leave the live session untouched — the server's failed
+                // recover rolls back to the old socket.
+                drop(stream);
+                return Err(ConnectFailure::Protocol(
+                    "this id already has a live session on the server and a fresh client                      cannot resume it; rerun the ssh handshake to get a new id"
+                        .to_string(),
+                ));
+            }
             Err(e) => return Err(e),
         };
 
@@ -153,11 +175,15 @@ impl EtClient {
                                     break;
                                 }
                             }
-                            // NEW_CLIENT on reconnect: the server recreated
-                            // the entry (e.g. it restarted with our key
-                            // still registered via a live etterminal).
-                            // Upstream treats this as an error and retries.
-                            Ok(Handshake::NewClient(stream)) => drop(stream),
+                            // NEW_CLIENT on reconnect: the server kept the
+                            // key but lost the connection entry.
+                            Ok(Handshake::NewClient(stream)) => {
+                                drop(stream);
+                                let _ = events_tx
+                                    .send(Event::Dead(ClientDeadReason::ServerStateLost))
+                                    .await;
+                                return;
+                            }
                             Err(ConnectFailure::Rejected {
                                 status: ConnectStatus::InvalidKey,
                                 ..

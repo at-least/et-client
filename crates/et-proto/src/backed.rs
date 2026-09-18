@@ -46,9 +46,11 @@ use tokio::time::timeout;
 pub const MAX_BACKUP_BYTES: i64 = 64 * 1024 * 1024;
 /// Upstream `BackedWriter::DISCONNECT_BUFFER_BYTES`.
 pub const DISCONNECT_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
-/// Ceiling for every recover exchange (upstream: 30 s idle / 60 s absolute
-/// per handshake read).
-pub const RECOVER_TIMEOUT: Duration = Duration::from_secs(60);
+/// Ceiling for every recover exchange. Upstream bounds each handshake read
+/// at 30 s idle / 60 s absolute; a shorter ceiling bounds how long a bogus
+/// reconnect (anyone who knows the id can trigger one) stalls the victim's
+/// writes, which upstream blocks for the full window.
+pub const RECOVER_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_QUEUE_DEPTH: usize = 1024;
 const EVENT_QUEUE_DEPTH: usize = 1024;
 
@@ -157,12 +159,6 @@ impl BackedHandle {
 
     pub async fn shutdown(&self) {
         let _ = self.cmd_tx.send(Cmd::Shutdown).await;
-    }
-
-    /// True while the connection has a live socket. Diagnostic only —
-    /// writes are valid either way (they buffer).
-    pub fn is_connected(&self) -> bool {
-        !self.cmd_tx.is_closed()
     }
 }
 
@@ -323,8 +319,16 @@ impl BackedActor {
 
     async fn deliver_inbox(&mut self) {
         while let Some(bytes) = self.inbox.pop_front() {
+            // A frame that fails to parse is protocol corruption: skipping
+            // it without advancing the reader sequence would desynchronize
+            // every later recover (the peer would resend the wrong span).
             let Some(mut packet) = Packet::parse(&bytes) else {
-                continue;
+                self.shutting_down = true;
+                let _ = self
+                    .events_tx
+                    .send(BackedEvent::Dead(DeadReason::CryptoMismatch))
+                    .await;
+                return;
             };
             if packet.is_encrypted()
                 && packet.decrypt(&mut self.reader_crypto).is_err()

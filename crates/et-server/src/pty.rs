@@ -72,6 +72,12 @@ pub fn spawn_shell(
         });
     }
 
+    // The shell (and every descendant) must NOT inherit the master: with
+    // it open, closing our master cannot hang the tty up and any process
+    // in the session could read or inject terminal traffic.
+    set_cloexec(pty.master.as_raw_fd());
+    set_cloexec(slave_alive_during_spawn.as_raw_fd());
+
     let child = command.spawn()?;
 
     // Parent's slave copies must close so the child sees EOF on hangup.
@@ -82,6 +88,18 @@ pub fn spawn_shell(
     nix::fcntl::fcntl(&pty.master, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))?;
 
     Ok(Pty { master: pty.master, child })
+}
+
+fn set_cloexec(fd: RawFd) {
+    // BorrowedFd::borrow_raw keeps this a raw-fd helper (the fd is owned
+    // elsewhere); fcntl on macOS 0.31's nix wants AsFd, not RawFd.
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let flags = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFD).unwrap_or_default();
+    let _ = nix::fcntl::fcntl(
+        borrowed,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::from_bits_truncate(flags)
+            | nix::fcntl::FdFlag::FD_CLOEXEC),
+    );
 }
 
 /// `TIOCSWINSZ` (upstream `PseudoUserTerminal::setInfo`). The kernel
