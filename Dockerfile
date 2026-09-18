@@ -1,7 +1,7 @@
 # Linux test environment for et: the Rust workspace plus the upstream C++
 # binaries (et 7.0.0, protocol v6) for the interop suite. Used by
-# scripts/docker-test.sh — every run is also the project's Linux build
-# validation (PTY, unix sockets, ioctl paths were developed on macOS).
+# scripts/docker-test.sh and doubles as the client library's Linux build
+# validation.
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive

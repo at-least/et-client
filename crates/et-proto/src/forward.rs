@@ -663,8 +663,8 @@ mod tests {
 
     #[test]
     fn unix_socket_forms_parse_but_are_reported_unsupported() {
-        // The parser accepts what upstream accepts; the engine/CLI layer
-        // turns UnsupportedSocket into a user-facing error.
+        // The parser accepts what upstream accepts; callers turn
+        // UnsupportedSocket into a user-facing error.
         assert!(matches!(
             parse_ranges("/tmp/sock:8080"),
             Err(TunnelParseError::UnsupportedSocket(_))

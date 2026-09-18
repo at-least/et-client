@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the full test suite (including the C++ interop tests) inside a Linux
-# container: `scripts/docker-test.sh`. Also validates the Linux build — the
-# PTY/unix-socket/ioctl paths were developed on macOS.
+# container: `scripts/docker-test.sh`. Also validates the Linux build of the
+# client library and its tests.
 #
 # The repo is mounted read-write (cargo needs it) with a named volume caching
 # the Linux target dir across runs. ET_CPP_PREFIX points the interop tests at

@@ -1,11 +1,11 @@
-# et (Rust) — EternalTerminal, wire-compatible
+# et — EternalTerminal client library (Rust, wire-compatible)
 
-A Rust implementation of [EternalTerminal](https://github.com/MisterTea/EternalTerminal)
+A Rust client library for [EternalTerminal](https://github.com/MisterTea/EternalTerminal)
 (protocol version **6**), built for [conch](../conch): a remote shell whose
 session **survives disconnects and IP changes** without interrupting the
 program running inside it. Wire-compatible with the upstream C++
-`et` / `etserver` / `etterminal` binaries — verified by automated interop
-tests against the real C++ binaries (see *Interop* below).
+`etserver` / `etterminal` binaries — verified by automated interop tests
+against the real C++ binaries (see *Tests* below).
 
 ```
 crates/
@@ -13,7 +13,7 @@ crates/
               generated protobuf types, and the shared backed-connection
               state machine (backup buffer, sequence numbers, recover
               exchange)
-  et-client   the client library (TerminalSession) + `et` CLI
+  et-client   the client library (TerminalSession)
 tools/
   et-proto-gen  regenerates the committed protobuf code from proto/
 proto/        the upstream .proto files — the single source of truth
@@ -83,20 +83,18 @@ this build does not know (upstream's protobuf-lite drops them).
 
 ## Usage
 
-```sh
-cargo build --release
-# servers run upstream C++ etserver/etterminal (or any wire-compatible port)
-# client side
-target/release/et user@host:2022            # SSH handshake via system ssh
-target/release/et user@host -c "tail -f /var/log/syslog"
-```
-
-The `et` CLI shells out to the system `ssh` for the handshake only;
-everything else is Rust.
+Library-only — there is no shipped binary. Embedders call
+[`TerminalSession::start`](crates/et-client/src/session.rs) directly (doc
+example in [`crates/et-client/src/lib.rs`](crates/et-client/src/lib.rs),
+embedder surface in *For conch* below). The interop tests are the reference
+driver against real servers; deploy upstream C++ `etserver`/`etterminal`
+(`brew install et`, distro packages) or any wire-compatible server.
 
 ## For conch
 
-The client library is the embeddable surface (conch wraps it behind UniFFI):
+The client library is the embeddable surface: conch will embed it as a
+sibling path dep (the `mosh` pattern) and expose it over UniFFI from
+conch-core:
 
 - **No SSH dependency**: `et_client::ssh` exposes *pure functions* —
   [`generate_id_passkey`](crates/et-client/src/ssh.rs),
@@ -110,14 +108,14 @@ The client library is the embeddable surface (conch wraps it behind UniFFI):
   leak across the boundary; reconnect, catch-up, buffering, and keepalive
   enforcement are automatic inside the connection.
 - Same dep hygiene as conch-core: wire-format deps pinned exact
-  (`prost`, `crypto_secretbox`), committed `Cargo.lock`, `thiserror`.
+  (`buffa`, `crypto_secretbox`), committed `Cargo.lock`, `thiserror`.
 
 ```rust
 let idpasskey = et_client::ssh::generate_id_passkey();
 let command = et_client::ssh::etterminal_command(&idpasskey.id, &idpasskey.passkey,
                                                  "xterm-256color", &Default::default());
 // run `command` over russh, scrape ssh::parse_idpasskey_output(&stdout)…
-let mut session = TerminalSession::start("host:2022", idpasskey.id, &idpasskey.passkey,
+let mut session = TerminalSession::start("host:2022".into(), idpasskey.id, &idpasskey.passkey,
                                          &InitialPayload::default(),
                                          et_client::DEFAULT_KEEPALIVE).await?;
 session.send_terminal_info(24, 80, 0, 0).await?;
@@ -152,35 +150,38 @@ interop tests, and clippy inside it, validating the Linux build.
 
 ## Port forwarding
 
-`et -t 18000:8000,2222:22 user@host` and `et -r 5037:5037 user@host` are
-implemented (TCP ports; the range syntax `a-b:c-d`, comma lists, and ssh-style
-`bind:port:host:hostport` all parse like upstream `TunnelUtils`). The engine
-lives in `et_proto::forward` and runs identically on both roles: sources bind
-locally and emit `DESTINATION_REQUEST`s; destinations connect `::1` then
-`127.0.0.1` like upstream (the destination *name* is ignored for TCP).
-Unix-socket forwarding (`ENV:/path`, SSH agent) is not supported — the parser
-accepts those forms but the CLI and engine reject them with a clear error.
-Interop tests cover both directions against the C++ etserver.
+Forward and reverse TCP tunnels are implemented in the library:
+[`parse_ranges`](crates/et-proto/src/forward.rs) accepts `18000:8000`,
+range syntax `a-b:c-d`, comma lists, and ssh-style
+`bind:port:host:hostport` (like upstream `TunnelUtils`); the client passes
+sources to `TerminalSession::start_port_forwarding`, and reverse sources
+ride the `INITIAL_PAYLOAD`. The engine lives in `et_proto::forward` and is
+role-symmetric: sources bind locally and emit `DESTINATION_REQUEST`s;
+destinations connect `::1` then `127.0.0.1` like upstream (the destination
+*name* is ignored for TCP). Unix-socket forwarding (`ENV:/path`, SSH agent)
+is not supported — the parser accepts those forms but rejects them with a
+clear error. Interop tests cover both directions against the C++ etserver.
 
 ## Jumphost
 
-`et --jumphost [user@]jump:2022 user@dest -c …` implements the upstream
-topology end to end:
+The library implements the upstream jump topology:
 
 ```
-et client → jumphost etserver:2022 → etterminal --jump → destination etserver → etterminal(PTY)
+client → jumphost etserver:2022 → etterminal --jump → destination etserver → etterminal(PTY)
 ```
 
-The destination etterminal is launched first (over `ssh -J jump`), yielding
-the credentials both legs share; the jump etterminal is launched second with
-`--jump --dsthost --dstport`; the client then TCP-connects to the **jumphost**
-etserver with `jumphost=true` in its `INITIAL_PAYLOAD`. The jumphost etserver
-hands the payload to its jump etterminal as `JUMPHOST_INIT`, which opens a
-resilient `EtClient` connection to the destination etserver and relays packets
-hop by hop (each leg decrypts and re-encrypts; the destination etserver owns
-the terminal protocol and the keepalive echoes). Port forwarding works through
-the chain — PF frames relay to the destination etserver, which owns them, so
-`-t`/`-r` combine with `--jumphost`.
+The embedder launches the destination etterminal first (its handshake —
+over `ssh -J jump`, conch's russh, anything — yields the credentials both
+legs share), then the jump etterminal with `--jump --dsthost --dstport`;
+the client then TCP-connects to the **jumphost** etserver with
+`jumphost=true` in its `INITIAL_PAYLOAD`. The jumphost etserver hands the
+payload to its jump etterminal as `JUMPHOST_INIT`, which opens a resilient
+client connection to the destination etserver and relays packets hop by hop
+(each leg decrypts and re-encrypts; the destination etserver owns the
+terminal protocol and the keepalive echoes). Port forwarding works through
+the chain — PF frames relay to the destination etserver, which owns them —
+so tunnels combine with jumphost mode. The all-C++ interop test exercises
+exactly this chain.
 
 ## Not implemented (deliberately)
 
