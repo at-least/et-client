@@ -115,7 +115,7 @@ cargo test --test cpp_interop -- --ignored   # against real C++ binaries
   catch-up**, keepalive echo, `MISMATCHED_PROTOCOL`, `INVALID_KEY`.
 - **Interop tests** (`--ignored`; auto-skip without the binaries, set
   `ET_CPP_PREFIX` to override `/opt/homebrew`) run against the actual C++
-  binaries: Rust client ↔ C++ etserver + C++ etterminal (including kill /
+  binaries — verified against **brew et 7.0.0** (protocol version 6): Rust client ↔ C++ etserver + C++ etterminal (including kill /
   reconnect / catch-up), C++ etterminal registering with the Rust etserver,
   and the Rust etterminal registering with the C++ etserver. The fourth leg
   (C++ `et` client driving the Rust server) needs a local sshd and was

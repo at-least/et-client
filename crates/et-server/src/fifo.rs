@@ -57,7 +57,7 @@ pub fn create_directories_if_required(override_path: Option<&std::path::Path>) -
     if used_default {
         let home = home()?;
         for sub in [".local", ".local/share"] {
-            let _ = std::fs::create_dir(&home.join(sub));
+            let _ = std::fs::create_dir(home.join(sub));
         }
     }
     let etserver_dir = dir.join("etserver");

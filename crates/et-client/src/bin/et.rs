@@ -170,11 +170,16 @@ async fn main() -> std::process::ExitCode {
     let idpasskey = if idpasskey.id.is_empty() { fresh } else { idpasskey };
 
     // 2. Connect and run the terminal session.
-    let mut payload = InitialPayload::default();
-    payload.jumphost = Some(false);
-    payload
-        .environmentvariables
-        .insert("ET_VERSION".into(), format!("rust-{}", env!("CARGO_PKG_VERSION")));
+    let payload = InitialPayload {
+        jumphost: Some(false),
+        environmentvariables: [(
+            "ET_VERSION".to_string(),
+            format!("rust-{}", env!("CARGO_PKG_VERSION")),
+        )]
+        .into_iter()
+        .collect(),
+        ..InitialPayload::default()
+    };
 
     let mut session = match TerminalSession::start(
         format!("{}:{et_port}", cli.destination.host),
@@ -326,7 +331,7 @@ fn key_to_bytes(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Char(c) => {
             if ctrl {
                 let lower = c.to_ascii_uppercase();
-                if ('A'..='Z').contains(&lower) || lower == ' ' {
+                if lower.is_ascii_uppercase() || lower == ' ' {
                     out.push((lower as u8) & 0x1f);
                 } else if c == '?' {
                     out.push(0x1f);

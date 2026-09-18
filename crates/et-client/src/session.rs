@@ -13,6 +13,7 @@ use crate::connection::{EtClient, Event};
 use crate::error::ConnectFailure;
 use crate::connection::ClientDeadReason;
 use et_proto::backed::WriteError;
+use et_proto::ConnectStatus;
 
 /// Upstream `MAX_CLIENT_KEEP_ALIVE_DURATION`.
 pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(5);
@@ -20,6 +21,9 @@ pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(5);
 /// seconds and gives up ("Connect Timeout"); one generous window matches the
 /// effect without the retry bookkeeping.
 const INITIAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the initial connect may keep retrying `INVALID_KEY` while the
+/// freshly-launched etterminal is still registering with etserver.
+const INITIAL_INVALID_KEY_RETRY: Duration = Duration::from_secs(3);
 
 /// Failure of [`TerminalSession::start`].
 #[derive(Debug, thiserror::Error)]
@@ -82,7 +86,24 @@ impl TerminalSession {
         initial_payload: &InitialPayload,
         keepalive: Duration,
     ) -> Result<Self, StartError> {
-        let mut client = EtClient::connect(endpoint, id, passkey, keepalive).await?;
+        // A reconnecting client gets INVALID_KEY when the server has torn
+        // the session down — terminal. On the *initial* connect, though,
+        // INVALID_KEY can also mean the etterminal has not finished
+        // registering yet: upstream hides this behind the ssh round-trip
+        // latency, a russh-driven handshake has none. Retry briefly before
+        // giving up (deliberate divergence from upstream, which exits).
+        let deadline = std::time::Instant::now() + INITIAL_INVALID_KEY_RETRY;
+        let mut client = loop {
+            match EtClient::connect(endpoint.clone(), id.clone(), passkey, keepalive).await {
+                Ok(client) => break client,
+                Err(ConnectFailure::Rejected { status: ConnectStatus::InvalidKey, .. })
+                    if std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
         client
             .write(et_packet_type::INITIAL_PAYLOAD, initial_payload.encode_to_vec())
             .await?;
@@ -162,11 +183,9 @@ impl TerminalSession {
 
     /// Next session event; `None` after the session ended.
     pub async fn next_event(&mut self) -> Option<SessionEvent> {
-        loop {
-            match self.client.next_event().await? {
-                Event::Packet(packet) => return Some(SessionEvent::from_packet(packet)),
-                Event::Dead(reason) => return Some(SessionEvent::Dead(reason)),
-            }
+        match self.client.next_event().await? {
+            Event::Packet(packet) => Some(SessionEvent::from_packet(packet)),
+            Event::Dead(reason) => Some(SessionEvent::Dead(reason)),
         }
     }
 }

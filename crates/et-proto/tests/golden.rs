@@ -67,9 +67,11 @@ fn proto2_default_presence_is_serialized() {
 
 #[test]
 fn initial_payload_with_map_golden() {
-    let mut payload = InitialPayload::default();
-    payload.jumphost = Some(false);
-    payload.environmentvariables.insert("TERM".into(), "xterm".into());
+    let payload = InitialPayload {
+        jumphost: Some(false),
+        environmentvariables: [("TERM".to_string(), "xterm".to_string())].into_iter().collect(),
+        ..InitialPayload::default()
+    };
     // map entry: tag 3 (1A), len 11, key: 0A 04 TERM, value: 12 05 xterm
     // entry: 0x1A (tag 3, wire 2), len 13 = (0A 04 + "TERM") + (12 05 + "xterm")
     let expected = [

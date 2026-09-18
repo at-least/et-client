@@ -6,15 +6,24 @@ license.workspace = true
 repository.workspace = true
 description = "EternalTerminal client: resilient encrypted terminal sessions with reconnect and catch-up, wire-compatible with upstream C++."
 
+[features]
+# The `et` CLI (raw mode + resize events) pulls crossterm; embedders (conch)
+# use default-features = false and get the pure library.
+default = ["cli"]
+cli = ["dep:crossterm"]
+
+[[bin]]
+name = "et"
+path = "src/bin/et.rs"
+required-features = ["cli"]
+
 [dependencies]
 et-proto.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
 tokio.workspace = true
-
-# CLI-only convenience (raw mode, resize events); kept out of the library API.
-crossterm.workspace = true
+crossterm = { workspace = true, optional = true }
 
 [dev-dependencies]
 et-server = { workspace = true, features = ["testing"] }

@@ -30,6 +30,23 @@ fn cpp_bin(name: &str) -> Option<std::path::PathBuf> {
     path.exists().then_some(path)
 }
 
+/// Unique temp dir per call (see fullstack.rs for why pid+nanos collides).
+fn unique_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "et-{tag}-{}-{}-{n}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .unwrap()
@@ -60,15 +77,7 @@ impl Drop for CppStack {
 async fn start_cpp_stack() -> CppStack {
     let etserver = cpp_bin("etserver").expect("C++ et binaries required");
     let etterminal = cpp_bin("etterminal").expect("C++ et binaries required");
-    let dir = std::env::temp_dir().join(format!(
-        "et-cpp-interop-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = unique_dir("cpp-interop");
     let socket_path = dir.join("etserver.sock");
     let port = free_port();
 
@@ -236,15 +245,7 @@ async fn rust_client_talks_to_cpp_server() {
 #[tokio::test]
 #[ignore = "requires the C++ binaries (brew install et); run with --ignored"]
 async fn cpp_etterminal_registers_with_rust_server() {
-    let dir = std::env::temp_dir().join(format!(
-        "et-cpp-reg-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = unique_dir("cpp-reg");
     let socket_path = dir.join("etserver.sock");
 
     let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -337,15 +338,7 @@ async fn cpp_etterminal_registers_with_rust_server() {
 #[tokio::test]
 #[ignore = "requires the C++ binaries (brew install et); run with --ignored"]
 async fn rust_etterminal_registers_with_cpp_server() {
-    let dir = std::env::temp_dir().join(format!(
-        "et-rust-reg-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = unique_dir("rust-reg");
     let socket_path = dir.join("etserver.sock");
     let port = free_port();
 

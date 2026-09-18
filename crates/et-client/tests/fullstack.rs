@@ -19,6 +19,25 @@ fn test_id_passkey() -> (String, String) {
     ("tst0123456789abcd".to_string(), format!("pk{}", "a".repeat(30)))
 }
 
+/// Unique temp dir per call. `pid + nanos` alone collides: the macOS clock
+/// has ~microsecond resolution and parallel tests in one process start
+/// within the same tick.
+fn unique_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "et-{tag}-{}-{}-{n}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 struct Stack {
     port: u16,
     socket_path: std::path::PathBuf,
@@ -28,15 +47,7 @@ struct Stack {
 /// Binds etserver on an ephemeral port with a temp unix socket and spawns
 /// an etterminal registering `id`/`passkey` (using /bin/sh, no login files).
 async fn start_stack(id: &str, passkey: &str) -> Stack {
-    let dir = std::env::temp_dir().join(format!(
-        "et-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = unique_dir("test");
     let socket_path = dir.join("etserver.sock");
 
     let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -240,6 +251,93 @@ async fn keepalive_is_echoed_while_idle() {
     }
     assert!(got_keepalive, "no keepalive echo while idle; dead={dead_reason}");
     session.shutdown().await;
+}
+
+#[tokio::test]
+async fn initial_connect_retries_until_terminal_registers() {
+    // No sleep between server start and client connect: the etterminal is
+    // spawned late, so the first ConnectRequest legitimately hits
+    // INVALID_KEY and the start() retry window must absorb it.
+    let (id, passkey) = test_id_passkey();
+    let dir = std::env::temp_dir().join(format!(
+        "et-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket_path = dir.join("etserver.sock");
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let bound = et_server::server::bind(et_server::server::ServerOptions {
+        port: 0,
+        socket_path: Some(socket_path.clone()),
+    })
+    .await
+    .unwrap();
+    let port = bound.tcp.local_addr().unwrap().port();
+    tokio::spawn(et_server::server::serve(bound, shutdown_rx));
+
+    // The etterminal shows up a second in — while start() is already
+    // retrying. This mirrors conch's shape: connect immediately after the
+    // ssh command returns, registration still in flight.
+    let term_socket = socket_path.clone();
+    let term_home = dir.clone();
+    let term_id = id.clone();
+    let term_passkey = passkey.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let _ = et_server::terminal::run(et_server::terminal::TerminalOptions {
+            idpasskey: Some((term_id, term_passkey)),
+            term: Some("xterm-256color".into()),
+            socket_path: Some(term_socket),
+            shell: Some("/bin/sh".into()),
+            home: Some(term_home),
+        })
+        .await;
+    });
+
+    let payload = InitialPayload::default();
+    let mut session = TerminalSession::start(
+        format!("127.0.0.1:{port}"),
+        id.clone(),
+        &passkey,
+        &payload,
+        DEFAULT_KEEPALIVE,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("start should retry through the registration race: {e}"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "session never became usable");
+        match tokio::time::timeout(Duration::from_millis(500), session.next_event()).await {
+            Ok(Some(SessionEvent::Dead(reason))) => {
+                panic!("session died while waiting for registration: {reason:?}")
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("session ended before registration"),
+            Err(_) => {}
+        }
+        // Once the terminal registers and a reconnect lands, input works.
+        if session.send_input(b"echo LATE_$((21*2))\n").await.is_ok() {
+            let mut out: Vec<u8> = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if String::from_utf8_lossy(&out).contains("LATE_42") {
+                    session.shutdown().await;
+                    let _ = shutdown.send(true);
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "no LATE_42; got {out:?}");
+                match tokio::time::timeout(Duration::from_millis(300), session.next_event()).await
+                {
+                    Ok(Some(SessionEvent::TerminalBuffer(bytes))) => out.extend_from_slice(&bytes),
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("session died waiting for echo"),
+                    Err(_) => {}
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]

@@ -326,15 +326,15 @@ impl BackedActor {
             let Some(mut packet) = Packet::parse(&bytes) else {
                 continue;
             };
-            if packet.is_encrypted() {
-                if packet.decrypt(&mut self.reader_crypto).is_err() {
-                    self.shutting_down = true;
-                    let _ = self
-                        .events_tx
-                        .send(BackedEvent::Dead(DeadReason::CryptoMismatch))
-                        .await;
-                    return;
-                }
+            if packet.is_encrypted()
+                && packet.decrypt(&mut self.reader_crypto).is_err()
+            {
+                self.shutting_down = true;
+                let _ = self
+                    .events_tx
+                    .send(BackedEvent::Dead(DeadReason::CryptoMismatch))
+                    .await;
+                return;
             }
             // Inbound traffic resets the keepalive deadline; a KEEP_ALIVE
             // echo clears the outstanding-ping flag (upstream
