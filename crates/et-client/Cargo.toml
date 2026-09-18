@@ -24,6 +24,3 @@ thiserror.workspace = true
 getrandom.workspace = true
 tokio.workspace = true
 crossterm = { workspace = true, optional = true }
-
-[dev-dependencies]
-et-server = { workspace = true, features = ["testing"] }

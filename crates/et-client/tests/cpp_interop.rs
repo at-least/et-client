@@ -1,15 +1,14 @@
 //! Interop test against the **upstream C++ binaries** (brew `et`):
 //! Rust `TerminalSession` ↔ C++ `etserver` ↔ C++ `etterminal`.
 //!
-//! This is the wire-compatibility gate for conch: the nonce streams,
-//! packet framing, protobuf bytes, the INITIAL exchange, and the reconnect
-//! catch-up must all agree with the C++ implementation byte-for-byte.
+//! This is the wire-compatibility gate — and, since the Rust server was
+//! removed, also the only behavioural net for the client (reconnect,
+//! catch-up, keepalive, tunnels, jumphost). The nonce streams, packet
+//! framing, protobuf bytes, the INITIAL exchange, and the recover exchange
+//! must all agree with the C++ implementation byte-for-byte.
 //!
 //! Skips when the C++ binaries are absent (set `ET_CPP_PREFIX` to the
-//! install prefix; defaults to /opt/homebrew). The reverse leg (C++ `et`
-//! client ↔ Rust server) needs a local sshd to launch the remote command
-//! and is exercised manually; the launch command it runs is byte-compatible
-//! with `et_client::ssh::etterminal_command`.
+//! install prefix; defaults to /opt/homebrew); run with `--ignored`.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -19,18 +18,14 @@ use et_proto::InitialPayload;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 
-/// Fixed non-`XXX` credentials so the Rust etterminal does not regenerate
-/// (its IDPASSKEY line goes to the process stdout, not to the test).
-const FIXED_ID: &str = "tst0123456789abc"; // exactly 16 chars
-const FIXED_PASSKEY: &str = "pkaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
 fn cpp_bin(name: &str) -> Option<std::path::PathBuf> {
     let prefix = std::env::var("ET_CPP_PREFIX").unwrap_or_else(|_| "/opt/homebrew".into());
     let path = std::path::Path::new(&prefix).join("bin").join(name);
     path.exists().then_some(path)
 }
 
-/// Unique temp dir per call (see fullstack.rs for why pid+nanos collides).
+/// Unique temp dir per call: the process id alone would collide across
+/// rapid sequential calls within one test binary, so a counter is mixed in.
 fn unique_dir(_tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -90,6 +85,7 @@ async fn start_cpp_stack() -> CppStack {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .expect("spawn C++ etserver");
 
@@ -115,6 +111,7 @@ async fn start_cpp_stack() -> CppStack {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .expect("spawn C++ etterminal");
     terminal
@@ -126,16 +123,26 @@ async fn start_cpp_stack() -> CppStack {
         .unwrap();
 
     let mut stdout = terminal.stdout.take().unwrap();
+    let (id, passkey) = scrape_idpasskey(&mut stdout).await;
+
+    CppStack { port, id, passkey, server, terminal, dir }
+}
+
+/// Reads the `IDPASSKEY:<16>/<32>` line from an etterminal stdout,
+/// tolerating partial reads. The C++ side prints it only after the
+/// etserver confirms the registration, so a successful scrape also
+/// proves the registration round-trip completed.
+async fn scrape_idpasskey(stdout: &mut tokio::process::ChildStdout) -> (String, String) {
     let mut output = String::new();
     let mut buf = [0u8; 256];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    use tokio::io::AsyncReadExt;
-    let (id, passkey) = loop {
+    loop {
         assert!(tokio::time::Instant::now() < deadline, "no IDPASSKEY from C++ etterminal");
-        let n = tokio::time::timeout(Duration::from_millis(500), stdout.read(&mut buf))
-            .await
-            .unwrap()
-            .expect("read etterminal stdout");
+        let n = match tokio::time::timeout(Duration::from_millis(500), stdout.read(&mut buf)).await
+        {
+            Ok(read) => read.expect("read etterminal stdout"),
+            Err(_) => continue, // poll window elapsed; keep waiting until the deadline
+        };
         if n == 0 {
             panic!("C++ etterminal exited before IDPASSKEY");
         }
@@ -144,12 +151,10 @@ async fn start_cpp_stack() -> CppStack {
             let rest = &output[pos + "IDPASSKEY:".len()..];
             if rest.len() >= 16 + 1 + 32 {
                 let (id, passkey) = rest[..16 + 1 + 32].split_once('/').unwrap();
-                break (id.to_string(), passkey.to_string());
+                return (id.to_string(), passkey.to_string());
             }
         }
-    };
-
-    CppStack { port, id, passkey, server, terminal, dir }
+    }
 }
 
 #[tokio::test]
@@ -385,21 +390,21 @@ async fn reverse_tunnel_through_cpp_server() {
     pump.abort();
 }
 
-/// The full upstream jump topology with mixed implementations:
-/// Rust client → **C++ etserver (jump)** → **Rust etterminal --jump** →
-/// **C++ etserver (destination)** → **C++ etterminal** (PTY). Validates the
-/// jump relay's unix registration, JUMPHOST_INIT handling, destination
-/// ClientConnection, and the client leg against C++ `runJumpHost`.
+/// The full upstream jump topology, all-C++ on the server side:
+/// Rust client → **C++ etserver (jump)** → **C++ etterminal --jump** →
+/// **C++ etserver (destination)** → **C++ etterminal** (PTY). The
+/// destination etterminal registers first; its (server-regenerated)
+/// credentials are then fed to the jump etterminal — exactly what
+/// upstream's two-ssh handshake produces. Validates JUMPHOST_INIT
+/// handling, the jump relay, and the client leg against C++ `runJumpHost`.
 #[tokio::test]
 #[ignore = "requires the C++ binaries (brew install et); run with --ignored"]
-async fn jumphost_chain_with_cpp_servers() {
+async fn jumphost_chain_through_cpp_servers() {
     let _guard = INTEROP.lock().await;
     let dir = unique_dir("cpp-jump");
 
     // Destination: C++ etserver + C++ etterminal (regenerates credentials).
     let dest = start_cpp_stack().await;
-    let (dest_port, dest_id, dest_passkey) =
-        (dest.port, dest.id.clone(), dest.passkey.clone());
 
     // Jump: C++ etserver (its own fifo/port).
     let jump_fifo = dir.join("jump.sock");
@@ -414,6 +419,7 @@ async fn jumphost_chain_with_cpp_servers() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -425,25 +431,47 @@ async fn jumphost_chain_with_cpp_servers() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Rust etterminal --jump on the jumphost, registering the DESTINATION
-    // credentials (exactly what upstream's two-ssh handshake produces).
-    tokio::spawn(et_server::terminal::run(et_server::terminal::TerminalOptions {
-        idpasskey: Some((dest_id.clone(), dest_passkey.clone())),
-        term: Some("xterm-256color".into()),
-        socket_path: Some(jump_fifo.clone()),
-        shell: Some("/bin/sh".into()),
-        home: Some(dir.clone()),
-        jump: true,
-        dsthost: "127.0.0.1".into(),
-        dstport: dest_port,
-    }));
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // C++ etterminal --jump on the jumphost, registered with the
+    // DESTINATION credentials (non-XXX input keeps them; the IDPASSKEY
+    // line it prints proves the registration round-trip completed).
+    let etterminal = cpp_bin("etterminal").unwrap();
+    let mut jump_terminal = tokio::process::Command::new(&etterminal)
+        .arg("--serverfifo")
+        .arg(&jump_fifo)
+        .arg("--jump")
+        .arg("--dsthost")
+        .arg("127.0.0.1")
+        .arg("--dstport")
+        .arg(dest.port.to_string())
+        .env("HOME", &dir)
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let registration = format!("{}/{}_xterm-256color\n", dest.id, dest.passkey);
+    jump_terminal
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(registration.as_bytes())
+        .await
+        .unwrap();
+    let mut jump_stdout = jump_terminal.stdout.take().unwrap();
+    let (jump_id, jump_passkey) = scrape_idpasskey(&mut jump_stdout).await;
+    assert_eq!(
+        (jump_id.as_str(), jump_passkey.as_str()),
+        (dest.id.as_str(), dest.passkey.as_str()),
+        "jump registration diverged from the destination credentials"
+    );
 
     let payload = InitialPayload { jumphost: Some(true), ..Default::default() };
     let mut session = TerminalSession::start(
         format!("127.0.0.1:{jump_port}"),
-        dest_id.clone(),
-        &dest_passkey,
+        dest.id.clone(),
+        &dest.passkey,
         &payload,
         DEFAULT_KEEPALIVE,
     )
@@ -465,181 +493,8 @@ async fn jumphost_chain_with_cpp_servers() {
     }
     session.send_input(b"exit\n").await.unwrap();
     session.shutdown().await;
+    let _ = jump_terminal.start_kill();
     let _ = jump_server.start_kill();
     drop(dest); // tears the destination stack down
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// C++ `etterminal` registering with the **Rust** etserver over the unix
-/// leg: the TERMINAL_USER_INFO packet and the server→terminal typed frames
-/// must agree with the C++ client of that socket.
-#[tokio::test]
-#[ignore = "requires the C++ binaries (brew install et); run with --ignored"]
-async fn cpp_etterminal_registers_with_rust_server() {
-    let _guard = INTEROP.lock().await;
-    let dir = unique_dir("cpp-reg");
-    let socket_path = dir.join("etserver.sock");
-
-    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
-    let bound = et_server::server::bind(et_server::server::ServerOptions {
-        port: 0,
-        socket_path: Some(socket_path.clone()),
-    })
-    .await
-    .unwrap();
-    let port = bound.tcp.local_addr().unwrap().port();
-    tokio::spawn(et_server::server::serve(bound, shutdown_rx));
-
-    // C++ etterminal registers against the Rust server.
-    let mut terminal = tokio::process::Command::new(cpp_bin("etterminal").unwrap())
-        .arg("--serverfifo")
-        .arg(&socket_path)
-        .env("HOME", &dir)
-        .env("SHELL", "/bin/sh")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    terminal
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"XXX0123456789abc/pkaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_xterm-256color\n")
-        .await
-        .unwrap();
-
-    // The C++ side regenerates and prints; scrape it.
-    let mut stdout = terminal.stdout.take().unwrap();
-    let mut output = String::new();
-    let mut buf = [0u8; 256];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    use tokio::io::AsyncReadExt;
-    let (id, passkey) = loop {
-        assert!(tokio::time::Instant::now() < deadline, "no IDPASSKEY from C++ etterminal");
-        let n = tokio::time::timeout(Duration::from_millis(500), stdout.read(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        if n == 0 {
-            panic!("C++ etterminal exited before IDPASSKEY");
-        }
-        output.push_str(&String::from_utf8_lossy(&buf[..n]));
-        if let Some(pos) = output.find("IDPASSKEY:") {
-            let rest = &output[pos + "IDPASSKEY:".len()..];
-            if rest.len() >= 16 + 1 + 32 {
-                let (id, passkey) = rest[..16 + 1 + 32].split_once('/').unwrap();
-                break (id.to_string(), passkey.to_string());
-            }
-        }
-    };
-
-    let payload = InitialPayload::default();
-    let mut session = TerminalSession::start(
-        format!("127.0.0.1:{port}"),
-        id,
-        &passkey,
-        &payload,
-        DEFAULT_KEEPALIVE,
-    )
-    .await
-    .expect("Rust client ↔ Rust server with C++ etterminal attached");
-    session.send_terminal_info(24, 80, 0, 0).await.unwrap();
-    session.send_input(b"echo MIX_RS_$((3*14))\n").await.unwrap();
-    let mut out: Vec<u8> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    while !String::from_utf8_lossy(&out).contains("MIX_RS_42") {
-        assert!(tokio::time::Instant::now() < deadline, "no MIX_RS_42; got {out:?}");
-        match tokio::time::timeout(Duration::from_millis(300), session.next_event()).await {
-            Ok(Some(SessionEvent::TerminalBuffer(bytes))) => out.extend_from_slice(&bytes),
-            Ok(Some(_)) => {}
-            Ok(None) => panic!("session died before echo"),
-            Err(_) => {}
-        }
-    }
-    session.send_input(b"exit\n").await.unwrap();
-    let _ = shutdown.send(true);
-    session.shutdown().await;
-    let _ = terminal.start_kill();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The **Rust** etterminal registering with the C++ etserver: its
-/// TERMINAL_USER_INFO packet and raw output stream must match what the C++
-/// server expects from its own etterminal.
-#[tokio::test]
-#[ignore = "requires the C++ binaries (brew install et); run with --ignored"]
-async fn rust_etterminal_registers_with_cpp_server() {
-    let _guard = INTEROP.lock().await;
-    let dir = unique_dir("rust-reg");
-    let socket_path = dir.join("etserver.sock");
-    let port = free_port();
-
-    let server_log = dir.join("etserver.log");
-    let mut server = tokio::process::Command::new(cpp_bin("etserver").unwrap())
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--serverfifo")
-        .arg(&socket_path)
-        .env("HOME", &dir)
-        .stdin(Stdio::null())
-        .stdout(std::fs::File::create(&server_log).unwrap())
-        .stderr(std::fs::File::create(dir.join("etserver.err")).unwrap())
-        .spawn()
-        .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            break;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "C++ etserver never listened");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    // Rust etterminal with fixed (non-XXX) credentials. Unlike the ssh
-    // path, there is no built-in delay between registration and the
-    // client's ConnectRequest, so give the daemon a beat to process the
-    // TERMINAL_USER_INFO packet.
-    tokio::spawn(et_server::terminal::run(et_server::terminal::TerminalOptions {
-        idpasskey: Some((FIXED_ID.to_string(), FIXED_PASSKEY.to_string())),
-        term: Some("xterm-256color".into()),
-        socket_path: Some(socket_path.clone()),
-        shell: Some("/bin/sh".into()),
-        home: Some(dir.clone()),
-        jump: false,
-        dsthost: String::new(),
-        dstport: 0,
-    }));
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let payload = InitialPayload::default();
-    let mut session = TerminalSession::start(
-        format!("127.0.0.1:{port}"),
-        FIXED_ID.to_string(),
-        FIXED_PASSKEY,
-        &payload,
-        DEFAULT_KEEPALIVE,
-    )
-    .await
-    .unwrap_or_else(|e| {
-        let log = std::fs::read_to_string(dir.join("etserver.err")).unwrap_or_default();
-        panic!("Rust client ↔ C++ etserver with Rust etterminal attached: {e}\netserver log: {log}");
-    });
-    session.send_terminal_info(24, 80, 0, 0).await.unwrap();
-    session.send_input(b"echo MIX2_RS_$((2*21))\n").await.unwrap();
-    let mut out: Vec<u8> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    while !String::from_utf8_lossy(&out).contains("MIX2_RS_42") {
-        assert!(tokio::time::Instant::now() < deadline, "no MIX2_RS_42; got {out:?}");
-        match tokio::time::timeout(Duration::from_millis(300), session.next_event()).await {
-            Ok(Some(SessionEvent::TerminalBuffer(bytes))) => out.extend_from_slice(&bytes),
-            Ok(Some(_)) => {}
-            Ok(None) => panic!("session died before echo"),
-            Err(_) => {}
-        }
-    }
-    session.send_input(b"exit\n").await.unwrap();
-    session.shutdown().await;
-    let _ = server.start_kill();
     let _ = std::fs::remove_dir_all(&dir);
 }

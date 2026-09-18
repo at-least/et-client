@@ -14,7 +14,6 @@ crates/
               state machine (backup buffer, sequence numbers, recover
               exchange)
   et-client   the client library (TerminalSession) + `et` CLI
-  et-server   `etserver` daemon + `etterminal` (PTY host) library + CLIs
 tools/
   et-proto-gen  regenerates the committed protobuf code from proto/
 proto/        the upstream .proto files — the single source of truth
@@ -86,8 +85,7 @@ this build does not know (upstream's protobuf-lite drops them).
 
 ```sh
 cargo build --release
-# server side (systemd/launchd usually; no self-daemonizing)
-target/release/etserver --port 2022
+# servers run upstream C++ etserver/etterminal (or any wire-compatible port)
 # client side
 target/release/et user@host:2022            # SSH handshake via system ssh
 target/release/et user@host -c "tail -f /var/log/syslog"
@@ -129,7 +127,7 @@ session.send_input(b"htop\n").await?;
 ## Tests
 
 ```sh
-cargo test                       # unit + golden-wire + full-stack (Rust only)
+cargo test                       # unit + golden-wire
 cargo test --test cpp_interop -- --ignored   # against real C++ binaries
 scripts/docker-test.sh           # the whole thing on Linux in a container
 ```
@@ -137,25 +135,20 @@ scripts/docker-test.sh           # the whole thing on Linux in a container
 `scripts/docker-test.sh` builds an Ubuntu 22.04 image with the upstream C++
 binaries (et 7.0.0 from the `jgmath2000/et` PPA — same protocol, same
 version family as the macOS verification) and runs the full suite, the C++
-interop tests, and clippy inside it. Every run doubles as the Linux build
-validation: the PTY, unix-socket, and ioctl paths are exercised on the
-platform etserver is actually deployed on.
+interop tests, and clippy inside it, validating the Linux build.
 
 - **Golden wire tests** lock every message encoding and frame layout against
   hand-computed protobuf bytes (the upstream `.proto` files in `proto/` are
   the reference).
-- **Full-stack tests** run client + etserver + etterminal in-process over
-  real TCP/unix sockets with `/bin/sh` on a real PTY: echo round-trip,
-  forced disconnect mid-`seq 1 20000` with **every line recovered via
-  catch-up**, keepalive echo, `MISMATCHED_PROTOCOL`, `INVALID_KEY`.
 - **Interop tests** (`--ignored`; auto-skip without the binaries, set
   `ET_CPP_PREFIX` to override `/opt/homebrew`) run against the actual C++
-  binaries — verified against **brew et 7.0.0** (protocol version 6): Rust client ↔ C++ etserver + C++ etterminal (including kill /
-  reconnect / catch-up), C++ etterminal registering with the Rust etserver,
-  and the Rust etterminal registering with the C++ etserver. The fourth leg
-  (C++ `et` client driving the Rust server) needs a local sshd and was
-  verified manually; the command the C++ client runs over ssh is
-  byte-identical to what `et_client::ssh::etterminal_command` produces.
+  binaries — verified against **brew et 7.0.0** (protocol version 6):
+  Rust client ↔ C++ etserver + C++ etterminal, including kill /
+  reconnect / catch-up (every line of a mid-stream `seq 1 5000` recovered)
+  and forward + reverse tunnels, plus the all-C++ jumphost chain
+  (C++ etserver → C++ `etterminal --jump` → C++ etserver → C++ etterminal).
+  With the Rust server removed, these are also the client's behavioural
+  net; `cargo test` alone covers encodings (golden) and pure functions.
 
 ## Port forwarding
 
@@ -193,12 +186,7 @@ the chain — PF frames relay to the destination etserver, which owns them, so
 
 - **Unix-socket forwarding** (`ENV:/path`, SSH agent): parsed like upstream,
   rejected with a clear error; TCP port forwarding is fully supported.
-- Windows. The unix leg and PTY layer are unix-only by design.
-- Upstream's `et.cfg` INI file (flags cover `--port`/`--serverfifo`).
-- Cosmetic divergences (documented in code): output rate limiting
-  (1024 lines/s) and the Ctrl+C output-flush optimization are omitted; the
-  PTY starts at 24x80 instead of 0x0 until the first resize arrives.
-- **Deliberate hardening beyond upstream** (each with a code comment): a
+- **Client-side hardening beyond upstream** (each with a code comment): a
   fresh client whose initial `ConnectRequest` answers `RETURNING_CLIENT`
   fails fast with a clear error instead of wedging ~60 s (a fresh client's
   nonce phase cannot resume a live stream); a reconnect answered
@@ -207,7 +195,6 @@ the chain — PF frames relay to the destination etserver, which owns them, so
   bound how long a bogus reconnect stalls the victim's writes; the initial
   connect retries `INVALID_KEY` briefly while the freshly-launched
   etterminal is still registering (upstream hides the race behind ssh
-  latency; a russh-driven handshake has none); the pty master is
-  `FD_CLOEXEC` so session processes cannot touch terminal traffic.
+  latency; a russh-driven handshake has none).
 
 Apache-2.0, matching upstream.
