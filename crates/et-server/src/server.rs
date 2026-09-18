@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use et_proto::backed::{BackedConfig, BackedEvent, BackedHandle};
 use et_proto::framing::{read_packet_frame, read_proto_frame, write_packet_frame, write_proto_frame, write_typed_proto};
-use et_proto::messages::{ConnectRequest, ConnectResponse, InitialPayload, TerminalBuffer};
-use prost::Message as _;
+use et_proto::{ConnectRequest, ConnectResponse, InitialPayload, TerminalBuffer};
+use buffa::Message as _;
 use et_proto::{
     ConnectStatus, Packet, CLIENT_SERVER_NONCE_MSB, DEFAULT_MAX_PROTO_LENGTH,
     MAX_HANDSHAKE_PROTO_LENGTH, PROTOCOL_VERSION, SERVER_CLIENT_NONCE_MSB, et_packet_type,
@@ -137,7 +137,7 @@ async fn register_terminal(router: Router, stream: UnixStream) {
     if packet.header() != terminal_packet_type::TERMINAL_USER_INFO {
         return;
     }
-    let Ok(tui) = crate::decode_payload::<et_proto::messages::TerminalUserInfo>(&packet) else {
+    let Ok(tui) = crate::decode_payload::<et_proto::TerminalUserInfo>(&packet) else {
         return;
     };
     let (Some(id), Some(passkey)) = (tui.id.clone(), tui.passkey.clone()) else {
@@ -154,29 +154,32 @@ async fn register_terminal(router: Router, stream: UnixStream) {
 async fn handle_tcp(router: Router, mut stream: TcpStream) {
     stream.set_nodelay(true).ok();
     let request = match read_proto_frame(&mut stream, MAX_HANDSHAKE_PROTO_LENGTH).await {
-        Ok(bytes) => ConnectRequest::decode(&bytes[..]),
+        Ok(bytes) => ConnectRequest::decode_from_slice(&bytes),
         Err(_) => return,
     };
     let Ok(request) = request else { return };
 
     if request.version != Some(PROTOCOL_VERSION) {
         let response = ConnectResponse {
-            status: Some(ConnectStatus::MismatchedProtocol as i32),
+            status: Some(ConnectStatus::MismatchedProtocol),
             error: Some(format!(
                 "Mismatched protocol versions. Your client & server must be on the same version of ET. Client: {} != Server: {PROTOCOL_VERSION}",
                 request.version.unwrap_or(0)
             )),
+            ..Default::default()
         };
         let _ = write_proto_frame(&mut stream, &response.encode_to_vec()).await;
         return;
     }
-    let Some(id) = request.client_id else { return };
+    let Some(id) = request.clientId else { return };
 
     if let Some(entry) = router.get_client(&id) {
         // `RETURNING_CLIENT`: hand the fresh socket to the live connection
         // for the SequenceHeader/CatchupBuffer exchange.
-        let response =
-            ConnectResponse { status: Some(ConnectStatus::ReturningClient as i32), error: None };
+        let response = ConnectResponse {
+            status: Some(ConnectStatus::ReturningClient),
+            ..Default::default()
+        };
         if write_proto_frame(&mut stream, &response.encode_to_vec()).await.is_err() {
             return;
         }
@@ -185,7 +188,10 @@ async fn handle_tcp(router: Router, mut stream: TcpStream) {
     }
 
     if let Some(key) = router.get_key(&id) {
-        let response = ConnectResponse { status: Some(ConnectStatus::NewClient as i32), error: None };
+        let response = ConnectResponse {
+            status: Some(ConnectStatus::NewClient),
+            ..Default::default()
+        };
         if write_proto_frame(&mut stream, &response.encode_to_vec()).await.is_err() {
             return;
         }
@@ -205,8 +211,9 @@ async fn handle_tcp(router: Router, mut stream: TcpStream) {
         tokio::spawn(run_session(router, id, key, conn, events));
     } else {
         let response = ConnectResponse {
-            status: Some(ConnectStatus::InvalidKey as i32),
+            status: Some(ConnectStatus::InvalidKey),
             error: Some("Client is not registered".into()),
+            ..Default::default()
         };
         let _ = write_proto_frame(&mut stream, &response.encode_to_vec()).await;
     }
@@ -245,8 +252,9 @@ async fn run_session(
     };
     if payload.jumphost == Some(true) {
         // Jump mode is not implemented in this port.
-        let response = et_proto::messages::InitialResponse {
+        let response = et_proto::InitialResponse {
             error: Some("jumphost mode is not supported by this etserver build".into()),
+            ..Default::default()
         };
         let _ = conn
             .write(et_packet_type::INITIAL_RESPONSE, response.encode_to_vec())
@@ -279,7 +287,7 @@ async fn run_session(
 
     // Success: empty INITIAL_RESPONSE (reverse tunnels would go here; not
     // implemented in this port).
-    let response = et_proto::messages::InitialResponse { error: None };
+    let response = et_proto::InitialResponse { error: None, ..Default::default() };
     if conn
         .write(et_packet_type::INITIAL_RESPONSE, response.encode_to_vec())
         .await
@@ -297,7 +305,11 @@ async fn run_session(
         names.push(k.clone());
         values.push(v.clone());
     }
-    let term_init = et_proto::messages::TermInit { environmentnames: names, environmentvalues: values };
+    let term_init = et_proto::TermInit {
+        environmentnames: names,
+        environmentvalues: values,
+        ..Default::default()
+    };
     if write_packet_frame(&mut unix, &Packet::new(terminal_packet_type::TERMINAL_INIT, term_init.encode_to_vec()))
         .await
         .is_err()
@@ -348,7 +360,10 @@ async fn run_session(
             read = unix_read.read(&mut chunk) => match read {
                 Ok(0) | Err(_) => break, // terminal session ended
                 Ok(n) => {
-                    let tb = TerminalBuffer { buffer: Some(chunk[..n].to_vec()) };
+                    let tb = TerminalBuffer {
+                        buffer: Some(chunk[..n].to_vec()),
+                        ..Default::default()
+                    };
                     if conn
                         .write(terminal_packet_type::TERMINAL_BUFFER, tb.encode_to_vec())
                         .await

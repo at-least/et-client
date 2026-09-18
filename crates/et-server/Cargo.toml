@@ -14,7 +14,7 @@ testing = []
 
 [dependencies]
 et-proto.workspace = true
-prost.workspace = true
+buffa.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 nix.workspace = true

@@ -7,7 +7,7 @@ repository.workspace = true
 description = "Wire layer of the EternalTerminal protocol: packets, framing, crypto, protobuf messages."
 
 [dependencies]
-prost.workspace = true
+buffa.workspace = true
 crypto_secretbox.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true

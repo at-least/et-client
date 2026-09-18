@@ -1,20 +1,20 @@
 //! Golden wire-format tests: the expected byte strings below are the
 //! hand-encoded protobuf wire format for the given messages, matching what
 //! the C++ implementation (protobuf, proto2, ordered fields) puts on the
-//! wire. They lock the Rust encoding against drift. Field-by-field:
+//! wire. They lock the generated code against drift. Field-by-field:
 //! `<tag byte> <len varint> <bytes>` for length-delimited, `<tag> <varint>`
 //! for ints; proto2 optional fields explicitly set to a default value must
 //! still be emitted (e.g. `08 00` for `jumphost = false`).
 
-use et_proto::messages::*;
+use buffa::Message as _;
 use et_proto::*;
-use prost::Message;
 
 #[test]
 fn connect_request_golden() {
     let req = ConnectRequest {
-        client_id: Some("XXX0123456789abcd".into()),
+        clientId: Some("XXX0123456789abcd".into()),
         version: Some(PROTOCOL_VERSION),
+        ..Default::default()
     };
     let mut expected = Vec::new();
     expected.push(0x0A);
@@ -22,31 +22,34 @@ fn connect_request_golden() {
     expected.extend_from_slice(b"XXX0123456789abcd");
     expected.extend_from_slice(&[0x10, 0x06]); // version = 6
     assert_eq!(req.encode_to_vec(), expected);
-    assert_eq!(ConnectRequest::decode(&expected[..]).unwrap(), req);
+    assert_eq!(ConnectRequest::decode_from_slice(&expected).unwrap(), req);
 }
 
 #[test]
 fn connect_response_golden() {
     let resp = ConnectResponse {
-        status: Some(ConnectStatus::ReturningClient as i32),
+        status: Some(ConnectStatus::RETURNING_CLIENT),
         error: None,
+        ..Default::default()
     };
     assert_eq!(resp.encode_to_vec(), vec![0x08, 0x02]);
 
     let err = ConnectResponse {
-        status: Some(ConnectStatus::MismatchedProtocol as i32),
+        status: Some(ConnectStatus::MISMATCHED_PROTOCOL),
         error: Some("boom".into()),
+        ..Default::default()
     };
     assert_eq!(err.encode_to_vec(), vec![0x08, 0x04, 0x12, 0x04, b'b', b'o', b'o', b'm']);
 }
 
 #[test]
 fn sequence_header_and_catchup_golden() {
-    let sh = SequenceHeader { sequence_number: Some(5) };
+    let sh = SequenceHeader { sequenceNumber: Some(5), ..Default::default() };
     assert_eq!(sh.encode_to_vec(), vec![0x08, 0x05]);
 
     let cb = CatchupBuffer {
         buffer: vec![b"a".to_vec(), vec![0x01, 0x02]],
+        ..Default::default()
     };
     assert_eq!(cb.encode_to_vec(), vec![0x0A, 0x01, b'a', 0x0A, 0x02, 0x01, 0x02]);
 }
@@ -54,11 +57,7 @@ fn sequence_header_and_catchup_golden() {
 #[test]
 fn proto2_default_presence_is_serialized() {
     // Some(false) must stay on the wire (proto2 explicit presence).
-    let p = InitialPayload {
-        jumphost: Some(false),
-        reversetunnels: Vec::new(),
-        environmentvariables: Default::default(),
-    };
+    let p = InitialPayload { jumphost: Some(false), ..Default::default() };
     assert_eq!(p.encode_to_vec(), vec![0x08, 0x00]);
     // None must be absent.
     let p = InitialPayload { jumphost: None, ..p };
@@ -69,10 +68,11 @@ fn proto2_default_presence_is_serialized() {
 fn initial_payload_with_map_golden() {
     let payload = InitialPayload {
         jumphost: Some(false),
-        environmentvariables: [("TERM".to_string(), "xterm".to_string())].into_iter().collect(),
-        ..InitialPayload::default()
+        environmentvariables: [("TERM".to_string(), "xterm".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
     };
-    // map entry: tag 3 (1A), len 11, key: 0A 04 TERM, value: 12 05 xterm
     // entry: 0x1A (tag 3, wire 2), len 13 = (0A 04 + "TERM") + (12 05 + "xterm")
     let expected = [
         0x08, 0x00, 0x1A, 0x0D, 0x0A, 0x04, b'T', b'E', b'R', b'M', 0x12, 0x05, b'x', b't', b'e',
@@ -83,7 +83,7 @@ fn initial_payload_with_map_golden() {
 
 #[test]
 fn terminal_buffer_golden() {
-    let tb = TerminalBuffer { buffer: Some(b"hi".to_vec()) };
+    let tb = TerminalBuffer { buffer: Some(b"hi".to_vec()), ..Default::default() };
     assert_eq!(tb.encode_to_vec(), vec![0x0A, 0x02, b'h', b'i']);
 }
 
@@ -92,6 +92,7 @@ fn term_init_golden() {
     let ti = TermInit {
         environmentnames: vec!["TERM".into()],
         environmentvalues: vec!["xterm-256color".into()],
+        ..Default::default()
     };
     let mut expected = vec![0x0A, 0x04];
     expected.extend_from_slice(b"TERM");
@@ -108,6 +109,7 @@ fn terminal_user_info_golden() {
         uid: Some(1000),
         gid: Some(20),
         fd: None,
+        ..Default::default()
     };
     let expected = [
         0x0A, 0x03, b'a', b'b', b'c', // id
@@ -126,6 +128,7 @@ fn terminal_info_golden() {
         column: Some(80),
         width: Some(0),
         height: Some(0),
+        ..Default::default()
     };
     let expected = [
         0x0A, 0x00, // id = ""
@@ -155,4 +158,14 @@ fn packet_and_frames_golden() {
     let mut unix = 3i64.to_le_bytes().to_vec();
     unix.extend_from_slice(&[0, 253, b'z']);
     assert_eq!(Packet::parse(&unix[8..]).unwrap(), p);
+}
+
+#[test]
+fn unknown_wire_values_route_to_unknown_fields() {
+    // proto2 closed-enum semantics: an unknown ConnectStatus value is not a
+    // variant; it rides the unknown-fields bag and survives re-encoding —
+    // strictly more faithful than dropping it.
+    let decoded = ConnectResponse::decode_from_slice(&[0x08, 0x63]).unwrap(); // status = 99
+    assert_eq!(decoded.status, None);
+    assert_eq!(decoded.encode_to_vec(), vec![0x08, 0x63]);
 }

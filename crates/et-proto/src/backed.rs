@@ -31,13 +31,13 @@ use std::time::{Duration, Instant};
 
 use crate::crypto::CryptoHandler;
 use crate::framing::{read_proto_frame, write_proto_frame};
-use crate::messages::{CatchupBuffer, SequenceHeader};
+use crate::gen::et::{CatchupBuffer, SequenceHeader};
 use crate::packet::Packet;
 use crate::{
     DEFAULT_MAX_PROTO_LENGTH, MAX_HANDSHAKE_PROTO_LENGTH, MAX_PACKET_LENGTH,
     terminal_packet_type,
 };
-use prost::Message as _;
+use buffa::Message as _;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -438,7 +438,7 @@ impl BackedActor {
     async fn recover(&mut self, stream: TcpStream) -> bool {
         let exchange = async {
             let mut stream = stream;
-            let sh = SequenceHeader { sequence_number: Some(self.reader_seq as i32) };
+            let sh = SequenceHeader { sequenceNumber: Some(self.reader_seq as i32), ..Default::default() };
             write_proto_frame(&mut stream, &sh.encode_to_vec())
                 .await
                 .map_err(|e| e.to_string())?;
@@ -446,9 +446,9 @@ impl BackedActor {
             let bytes = read_proto_frame(&mut stream, MAX_HANDSHAKE_PROTO_LENGTH)
                 .await
                 .map_err(|e| e.to_string())?;
-            let remote = SequenceHeader::decode(&bytes[..])
+            let remote = SequenceHeader::decode_from_slice(&bytes)
                 .map_err(|e| format!("bad SequenceHeader: {e}"))?;
-            let remote_seq = remote.sequence_number.unwrap_or(0);
+            let remote_seq = remote.sequenceNumber.unwrap_or(0);
 
             // `BackedWriter::recover`: newest `writer_seq - remote_seq`
             // backed-up packets, chronological. Pre-encrypted bytes only.
@@ -456,7 +456,7 @@ impl BackedActor {
             if to_recover < 0 {
                 return Err("peer claims more of our packets than we ever sent".to_string());
             }
-            let mut catchup = CatchupBuffer { buffer: Vec::new() };
+            let mut catchup = CatchupBuffer { buffer: Vec::new(), ..Default::default() };
             if to_recover > 0 {
                 if self.backup.len() < to_recover as usize {
                     return Err(format!(
@@ -475,7 +475,8 @@ impl BackedActor {
                 .await
                 .map_err(|e| e.to_string())?;
             let their_catchup =
-                CatchupBuffer::decode(&bytes[..]).map_err(|e| format!("bad CatchupBuffer: {e}"))?;
+                CatchupBuffer::decode_from_slice(&bytes)
+                    .map_err(|e| format!("bad CatchupBuffer: {e}"))?;
             Ok((stream, their_catchup.buffer))
         };
 

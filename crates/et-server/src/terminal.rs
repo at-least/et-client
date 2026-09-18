@@ -18,9 +18,9 @@ use tokio::io::AsyncWriteExt;
 use std::os::fd::{AsRawFd, RawFd};
 
 use et_proto::framing::{read_packet_frame, read_proto_frame, write_packet_frame};
-use et_proto::messages::{TerminalBuffer, TerminalInfo, TerminalUserInfo};
+use et_proto::{TerminalBuffer, TerminalInfo, TerminalUserInfo};
+use buffa::Message as _;
 use et_proto::{Packet, DEFAULT_MAX_PROTO_LENGTH, terminal_packet_type};
-use prost::Message;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
 
@@ -67,6 +67,7 @@ pub async fn run(opts: TerminalOptions) -> Result<(), ServerError> {
         uid: Some(nix::unistd::Uid::effective().as_raw() as i64),
         gid: Some(nix::unistd::Gid::effective().as_raw() as i64),
         fd: None,
+        ..Default::default()
     };
     write_packet_frame(
         &mut stream,
@@ -87,7 +88,7 @@ pub async fn run(opts: TerminalOptions) -> Result<(), ServerError> {
                 eprintln!("etterminal: waiting for TERMINAL_INIT failed: {e}");
                 e
             })?;
-    let term_init = et_proto::messages::TermInit::decode(&init_packet[..])
+    let term_init = et_proto::TermInit::decode_from_slice(&init_packet[..])
         .map_err(|e| ServerError::Other(format!("bad TermInit: {e}")))?;
     let mut session_env = BTreeMap::new();
     for (name, value) in term_init.environmentnames.iter().zip(&term_init.environmentvalues) {
@@ -209,12 +210,12 @@ async fn read_typed_frame(stream: &mut tokio::net::unix::ReadHalf<'_>) -> Result
     let proto = read_proto_frame(stream, DEFAULT_MAX_PROTO_LENGTH).await?;
     match packet_type[0] {
         terminal_packet_type::TERMINAL_BUFFER => {
-            let tb = TerminalBuffer::decode(&proto[..])
+            let tb = TerminalBuffer::decode_from_slice(&proto)
                 .map_err(|e| ServerError::Other(format!("bad TerminalBuffer: {e}")))?;
             Ok(TypedFrame::TerminalBuffer(tb.buffer.unwrap_or_default()))
         }
         terminal_packet_type::TERMINAL_INFO => {
-            let ti = TerminalInfo::decode(&proto[..])
+            let ti = TerminalInfo::decode_from_slice(&proto)
                 .map_err(|e| ServerError::Other(format!("bad TerminalInfo: {e}")))?;
             Ok(TypedFrame::TerminalInfo(ti))
         }

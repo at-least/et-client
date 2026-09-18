@@ -5,9 +5,9 @@
 
 use std::time::Duration;
 
-use et_proto::messages::{InitialPayload, InitialResponse, TerminalBuffer, TerminalInfo};
+use et_proto::{InitialPayload, InitialResponse, TerminalBuffer, TerminalInfo};
 use et_proto::{et_packet_type, terminal_packet_type, Packet};
-use prost::Message;
+use buffa::Message as _;
 
 use crate::connection::{EtClient, Event};
 use crate::error::ConnectFailure;
@@ -59,7 +59,7 @@ impl SessionEvent {
     fn from_packet(packet: Packet) -> Self {
         match packet.header() {
             terminal_packet_type::TERMINAL_BUFFER => SessionEvent::TerminalBuffer(
-                TerminalBuffer::decode(packet.payload())
+                TerminalBuffer::decode_from_slice(packet.payload())
                     .ok()
                     .and_then(|tb| tb.buffer)
                     .unwrap_or_default(),
@@ -115,7 +115,7 @@ impl TerminalSession {
                         if packet.header() != et_packet_type::INITIAL_RESPONSE {
                             continue;
                         }
-                        let response = InitialResponse::decode(packet.payload())
+                        let response = InitialResponse::decode_from_slice(packet.payload())
                             .map_err(|_| StartError::UnexpectedPacket)?;
                         if let Some(error) = response.error {
                             return Err(StartError::Server(error));
@@ -139,7 +139,7 @@ impl TerminalSession {
 
     /// Send raw input to the shell (`TERMINAL_BUFFER`).
     pub async fn send_input(&self, data: &[u8]) -> Result<(), WriteError> {
-        let tb = TerminalBuffer { buffer: Some(data.to_vec()) };
+        let tb = TerminalBuffer { buffer: Some(data.to_vec()), ..Default::default() };
         self.client
             .write(terminal_packet_type::TERMINAL_BUFFER, tb.encode_to_vec())
             .await
@@ -159,6 +159,7 @@ impl TerminalSession {
             column: Some(column),
             width: Some(width),
             height: Some(height),
+            ..Default::default()
         };
         self.client
             .write(terminal_packet_type::TERMINAL_INFO, ti.encode_to_vec())

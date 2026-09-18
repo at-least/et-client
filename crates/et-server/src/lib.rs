@@ -38,8 +38,9 @@ impl From<et_proto::FrameError> for ServerError {
 }
 
 /// Reads the payload of a packet as a protobuf message.
-pub(crate) fn decode_payload<M: prost::Message + Default>(
+pub(crate) fn decode_payload<M: buffa::Message + Default>(
     packet: &et_proto::Packet,
 ) -> Result<M, String> {
-    M::decode(packet.payload()).map_err(|e| format!("bad {}: {e}", std::any::type_name::<M>()))
+    M::decode_from_slice(packet.payload())
+        .map_err(|e| format!("bad {}: {e}", std::any::type_name::<M>()))
 }

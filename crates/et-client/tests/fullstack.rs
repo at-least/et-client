@@ -9,9 +9,9 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use et_client::session::{SessionEvent, TerminalSession, DEFAULT_KEEPALIVE};
-use et_proto::messages::{ConnectRequest, InitialPayload};
+use buffa::Message as _;
+use et_proto::{ConnectRequest, InitialPayload};
 use et_proto::PROTOCOL_VERSION;
-use prost::Message;
 
 /// A non-`XXX` id (so etterminal does not regenerate) with a 32-char
 /// alphanumeric passkey (constructed, not hand-counted).
@@ -385,18 +385,19 @@ async fn mismatched_protocol_is_rejected() {
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", stack.port))
         .await
         .unwrap();
-    let request = ConnectRequest { client_id: Some(id), version: Some(PROTOCOL_VERSION - 1) };
+    let request = ConnectRequest {
+        clientId: Some(id),
+        version: Some(PROTOCOL_VERSION - 1),
+        ..Default::default()
+    };
     et_proto::write_proto_frame(&mut stream, &request.encode_to_vec())
         .await
         .unwrap();
     let bytes = et_proto::read_proto_frame(&mut stream, et_proto::MAX_HANDSHAKE_PROTO_LENGTH)
         .await
         .unwrap();
-    let response = et_proto::messages::ConnectResponse::decode(&bytes[..]).unwrap();
-    assert_eq!(
-        response.connect_status(),
-        Some(et_proto::ConnectStatus::MismatchedProtocol)
-    );
+    let response = et_proto::ConnectResponse::decode_from_slice(&bytes).unwrap();
+    assert_eq!(response.status, Some(et_proto::ConnectStatus::MismatchedProtocol));
     assert!(response.error.unwrap().contains("Mismatched protocol versions"));
 }
 
@@ -409,8 +410,9 @@ async fn unknown_id_is_invalid_key() {
         .await
         .unwrap();
     let request = ConnectRequest {
-        client_id: Some("ZZZno-such-client00".into()),
+        clientId: Some("ZZZno-such-client00".into()),
         version: Some(PROTOCOL_VERSION),
+        ..Default::default()
     };
     et_proto::write_proto_frame(&mut stream, &request.encode_to_vec())
         .await
@@ -418,7 +420,7 @@ async fn unknown_id_is_invalid_key() {
     let bytes = et_proto::read_proto_frame(&mut stream, et_proto::MAX_HANDSHAKE_PROTO_LENGTH)
         .await
         .unwrap();
-    let response = et_proto::messages::ConnectResponse::decode(&bytes[..]).unwrap();
-    assert_eq!(response.connect_status(), Some(et_proto::ConnectStatus::InvalidKey));
+    let response = et_proto::ConnectResponse::decode_from_slice(&bytes).unwrap();
+    assert_eq!(response.status, Some(et_proto::ConnectStatus::InvalidKey));
     assert_eq!(response.error.as_deref(), Some("Client is not registered"));
 }

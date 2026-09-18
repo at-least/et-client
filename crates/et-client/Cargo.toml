@@ -19,7 +19,7 @@ required-features = ["cli"]
 
 [dependencies]
 et-proto.workspace = true
-prost.workspace = true
+buffa.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
 tokio.workspace = true

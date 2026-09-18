@@ -10,11 +10,14 @@ tests against the real C++ binaries (see *Interop* below).
 ```
 crates/
   et-proto    wire layer: packets, framing, XSalsa20-Poly1305 crypto,
-              protobuf messages, and the shared backed-connection state
-              machine (backup buffer, sequence numbers, recover exchange)
+              generated protobuf types, and the shared backed-connection
+              state machine (backup buffer, sequence numbers, recover
+              exchange)
   et-client   the client library (TerminalSession) + `et` CLI
   et-server   `etserver` daemon + `etterminal` (PTY host) library + CLIs
-proto/        the upstream .proto files, kept verbatim as the reference
+tools/
+  et-proto-gen  regenerates the committed protobuf code from proto/
+proto/        the upstream .proto files — the single source of truth
 ```
 
 ## The protocol in one page
@@ -41,6 +44,14 @@ et (client) ──TCP 2022── etserver ──unix socket── etterminal (PT
    little-endian **before** every operation. The passkey string *is* the
    32-byte key, so etserver relays ciphertext without decrypting terminal
    data.
+
+   Crypto provenance: the primitive is the RustCrypto
+   [`crypto_secretbox`](https://crates.io/crates/crypto_secretbox) crate
+   (exact-pinned) — nothing cryptographic is implemented by hand. The only
+   hand-written crypto-adjacent code is `CryptoHandler`'s ~60 lines of nonce
+   bookkeeping, which is ET **protocol logic** (the counter scheme above is
+   fixed by the wire format and interop-tested against the C++ binaries); no
+   crate provides it.
 3. **Roaming/reconnect.** On any socket death the client retries every
    second. `RETURNING_CLIENT` triggers the recover exchange (both peers run
    the identical sequence, so nobody deadlocks): swap `SequenceHeader`
@@ -54,6 +65,22 @@ The unix leg (etserver↔etterminal, an `AF_UNIX` stream despite the
 historical "fifo" name) is unencrypted and asymmetric: registration/init are
 `[i64 LE length][packet]` frames; toward the terminal the server writes
 `[type:u8][i64-framed proto]`; terminal output is a raw byte stream.
+
+**Protobuf codegen.** The message types in `crates/et-proto/src/gen/` are
+generated from `proto/*.proto` with [buffa](https://github.com/anthropics/buffa)
+(pure Rust, conformance-tested, editions-first) and **committed**. When
+upstream's protos change:
+
+```sh
+cargo run -p et-proto-gen   # needs protoc on PATH; regen is a manual act
+```
+
+The workspace builds without protoc or the generator. This kills the
+hand-transcription drift risk: the `.proto` file is the schema, the generator
+is the only transcription step, and the golden-bytes + C++ interop tests below
+verify the result against upstream itself. Buffa also preserves unknown fields
+through decode/re-encode, so a relayed packet from a newer peer keeps fields
+this build does not know (upstream's protobuf-lite drops them).
 
 ## Usage
 

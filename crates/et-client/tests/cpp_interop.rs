@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use et_client::session::{SessionEvent, TerminalSession, DEFAULT_KEEPALIVE};
-use et_proto::messages::InitialPayload;
+use et_proto::InitialPayload;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 

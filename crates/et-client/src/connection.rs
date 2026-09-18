@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 use et_proto::backed::{BackedConfig, BackedEvent, BackedHandle, WriteError};
-use et_proto::messages::{ConnectRequest, ConnectResponse};
-use prost::Message as _;
+use et_proto::{ConnectRequest, ConnectResponse};
+use buffa::Message as _;
 use et_proto::{
     ConnectStatus, DeadReason, Packet, CLIENT_SERVER_NONCE_MSB, MAX_HANDSHAKE_PROTO_LENGTH,
     PROTOCOL_VERSION, SERVER_CLIENT_NONCE_MSB,
@@ -68,8 +68,9 @@ async fn handshake_request(endpoint: &str, id: &str) -> Result<Handshake, Connec
     let attempt = async {
         let mut stream = TcpStream::connect(endpoint.to_string()).await?;
         let request = ConnectRequest {
-            client_id: Some(id.to_string()),
+            clientId: Some(id.to_string()),
             version: Some(PROTOCOL_VERSION),
+            ..Default::default()
         };
         et_proto::write_proto_frame(&mut stream, &request.encode_to_vec())
             .await
@@ -81,9 +82,9 @@ async fn handshake_request(endpoint: &str, id: &str) -> Result<Handshake, Connec
         .await
         .map_err(|_| ConnectFailure::Timeout)?
         .map_err(frame_error_to_connect_failure)?;
-        let response = ConnectResponse::decode(&bytes[..])
+        let response = ConnectResponse::decode_from_slice(&bytes)
             .map_err(|e| ConnectFailure::Protocol(format!("bad ConnectResponse: {e}")))?;
-        match ConnectStatus::from_i32(response.status()) {
+        match response.status {
             Some(ConnectStatus::NewClient) => Ok(Handshake::NewClient(stream)),
             Some(ConnectStatus::ReturningClient) => Ok(Handshake::Returning(stream)),
             Some(status) => Err(ConnectFailure::Rejected {

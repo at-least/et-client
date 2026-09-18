@@ -7,7 +7,7 @@
 //!
 //! ```no_run
 //! use et_client::session::TerminalSession;
-//! use et_proto::messages::InitialPayload;
+//! use et_proto::InitialPayload;
 //!
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! // id/passkey come from the SSH handshake (see et_client::ssh).

@@ -148,21 +148,22 @@ pub async fn write_unframed<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messages::ConnectRequest;
-    use prost::Message;
+    use crate::gen::et::ConnectRequest;
+    use buffa::Message as _;
 
     #[tokio::test]
     async fn proto_frame_round_trip() {
         let mut buf = Vec::new();
         let req = ConnectRequest {
-            client_id: Some("XXXabcdefghijklmnop".into()),
+            clientId: Some("XXXabcdefghijklmnop".into()),
             version: Some(crate::PROTOCOL_VERSION),
+            ..Default::default()
         };
         write_proto_frame(&mut buf, &req.encode_to_vec()).await.unwrap();
         let decoded = read_proto_frame(&mut &buf[..], crate::MAX_HANDSHAKE_PROTO_LENGTH)
             .await
             .unwrap();
-        assert_eq!(ConnectRequest::decode(&decoded[..]).unwrap(), req);
+        assert_eq!(ConnectRequest::decode_from_slice(&decoded).unwrap(), req);
     }
 
     #[tokio::test]

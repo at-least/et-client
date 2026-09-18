@@ -20,8 +20,8 @@
 pub mod backed;
 pub mod crypto;
 pub mod framing;
+pub mod gen;
 pub mod ids;
-pub mod messages;
 pub mod packet;
 
 pub use backed::{BackedConfig, BackedEvent, BackedHandle, DeadReason, WriteError};
@@ -30,7 +30,7 @@ pub use framing::{
     read_framed_packet, read_packet_frame, read_proto_frame, write_framed_packet,
     write_packet_frame, write_proto_frame, write_typed_proto, write_unframed, FrameError,
 };
-pub use messages::*;
+pub use gen::et::*;
 pub use packet::Packet;
 
 /// Upstream `Headers.hpp`: `static const int PROTOCOL_VERSION = 6`.
@@ -77,23 +77,6 @@ pub mod terminal_packet_type {
     pub const JUMPHOST_INIT: u8 = 10;
 }
 
-/// Upstream `ConnectStatus` (`ET.proto`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectStatus {
-    NewClient = 1,
-    ReturningClient = 2,
-    InvalidKey = 3,
-    MismatchedProtocol = 4,
-}
-
-impl ConnectStatus {
-    pub fn from_i32(v: i32) -> Option<Self> {
-        Some(match v {
-            1 => ConnectStatus::NewClient,
-            2 => ConnectStatus::ReturningClient,
-            3 => ConnectStatus::InvalidKey,
-            4 => ConnectStatus::MismatchedProtocol,
-            _ => return None,
-        })
-    }
-}
+// `ConnectStatus` and every message type come from the generated module
+// (`gen/et.rs`), re-exported above. Unknown enum values on the wire route
+// to unknown fields (proto2 closed-enum semantics, like the C++ side).
