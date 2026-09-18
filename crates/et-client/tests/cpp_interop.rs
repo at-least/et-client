@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use et_client::session::{SessionEvent, TerminalSession, DEFAULT_KEEPALIVE};
 use et_proto::InitialPayload;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 
 /// Fixed non-`XXX` credentials so the Rust etterminal does not regenerate
@@ -238,6 +238,151 @@ async fn rust_client_talks_to_cpp_server() {
         }
     }
     session.shutdown().await;
+}
+
+/// ECHO server on an ephemeral port; returns the port.
+async fn spawn_echo_listener() -> u16 {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+fn free_tcp_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn tunnel_request(source_port: u16, destination_port: u16) -> et_proto::PortForwardSourceRequest {
+    et_proto::PortForwardSourceRequest {
+        source: et_proto::SocketEndpoint {
+            name: Some("127.0.0.1".into()),
+            port: Some(source_port as i32),
+            ..Default::default()
+        }
+        .into(),
+        destination: et_proto::SocketEndpoint {
+            name: None,
+            port: Some(destination_port as i32),
+            ..Default::default()
+        }
+        .into(),
+        ..Default::default()
+    }
+}
+
+/// Forward tunnel through the **C++ etserver**: our Rust client listens,
+/// the C++ server opens the loopback destination (`createDestination`).
+#[tokio::test]
+#[ignore = "requires the C++ binaries (brew install et); run with --ignored"]
+async fn forward_tunnel_through_cpp_server() {
+    let _guard = INTEROP.lock().await;
+    let stack = start_cpp_stack().await;
+    let echo_port = spawn_echo_listener().await;
+    let client_port = free_tcp_port();
+
+    let payload = InitialPayload::default();
+    let mut session = TerminalSession::start(
+        format!("127.0.0.1:{}", stack.port),
+        stack.id.clone(),
+        &stack.passkey,
+        &payload,
+        DEFAULT_KEEPALIVE,
+    )
+    .await
+    .expect("handshake");
+    session.send_terminal_info(24, 80, 0, 0).await.unwrap();
+    session
+        .start_port_forwarding(vec![tunnel_request(client_port, echo_port)])
+        .await
+        .expect("start forward tunnel");
+
+    let pump = tokio::spawn(async move {
+        loop {
+            if session.next_event().await.is_none() {
+                return;
+            }
+        }
+    });
+
+    let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", client_port))
+        .await
+        .expect("connect to forwarded port");
+    conn.write_all(b"CPP_PF_9").await.unwrap();
+    let mut buf = [0u8; 8];
+    tokio::time::timeout(Duration::from_secs(15), conn.read_exact(&mut buf))
+        .await
+        .expect("echo timeout")
+        .unwrap();
+    assert_eq!(&buf, b"CPP_PF_9");
+    pump.abort();
+}
+
+/// Reverse tunnel through the **C++ etserver**: the C++ server listens
+/// (`createSource`) and sends DESTINATION_REQUESTs; our Rust client opens
+/// the loopback destination and must answer with RESPONSE/DATA.
+#[tokio::test]
+#[ignore = "requires the C++ binaries (brew install et); run with --ignored"]
+async fn reverse_tunnel_through_cpp_server() {
+    let _guard = INTEROP.lock().await;
+    let stack = start_cpp_stack().await;
+    let client_echo_port = spawn_echo_listener().await;
+    let server_listen_port = free_tcp_port();
+
+    let payload = InitialPayload {
+        reversetunnels: vec![tunnel_request(server_listen_port, client_echo_port)],
+        ..Default::default()
+    };
+    let mut session = TerminalSession::start(
+        format!("127.0.0.1:{}", stack.port),
+        stack.id.clone(),
+        &stack.passkey,
+        &payload,
+        DEFAULT_KEEPALIVE,
+    )
+    .await
+    .expect("handshake with reverse tunnel");
+    session.send_terminal_info(24, 80, 0, 0).await.unwrap();
+
+    let pump = tokio::spawn(async move {
+        loop {
+            if session.next_event().await.is_none() {
+                return;
+            }
+        }
+    });
+
+    let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", server_listen_port))
+        .await
+        .expect("connect to C++ reverse-tunnel listener");
+    conn.write_all(b"CPP_REV_4").await.unwrap();
+    let mut buf = [0u8; 9];
+    tokio::time::timeout(Duration::from_secs(15), conn.read_exact(&mut buf))
+        .await
+        .expect("echo timeout")
+        .unwrap();
+    assert_eq!(&buf, b"CPP_REV_4");
+    pump.abort();
 }
 
 /// C++ `etterminal` registering with the **Rust** etserver over the unix

@@ -5,9 +5,15 @@
 
 use std::time::Duration;
 
-use et_proto::{InitialPayload, InitialResponse, TerminalBuffer, TerminalInfo};
+use et_proto::forward::{
+    DESTINATION_REQUEST_HEADER, DESTINATION_RESPONSE_HEADER, EngineHandle, PORT_FORWARD_HEADER,
+};
+use et_proto::{
+    InitialPayload, InitialResponse, PortForwardSourceRequest, TerminalBuffer, TerminalInfo,
+};
 use et_proto::{et_packet_type, terminal_packet_type, Packet};
 use buffa::Message as _;
+use tokio::sync::mpsc;
 
 use crate::connection::{EtClient, Event};
 use crate::error::ConnectFailure;
@@ -73,6 +79,10 @@ impl SessionEvent {
 /// A resilient encrypted terminal session with an `etserver`.
 pub struct TerminalSession {
     client: EtClient,
+    /// Port-forward engine once [`TerminalSession::start_port_forwarding`]
+    /// ran: peer PF frames route in, engine frames write out.
+    pf_inbound: Option<EngineHandle>,
+    pf_outbound: Option<mpsc::UnboundedReceiver<Packet>>,
 }
 
 impl TerminalSession {
@@ -134,7 +144,42 @@ impl TerminalSession {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(StartError::Timeout),
         }
-        Ok(Self { client })
+        // Upstream clients always run a port-forward handler; when this
+        // session declared reverse tunnels, the peer WILL send
+        // DESTINATION_REQUESTs — start the engine (destinations only, no
+        // local listeners) so they are answered instead of surfacing as
+        // unknown packets.
+        let (mut pf_inbound, mut pf_outbound) = (None, None);
+        if !initial_payload.reversetunnels.is_empty() {
+            let (handle, outbound_rx, _) = EngineHandle::spawn(Vec::new(), true).await;
+            pf_inbound = Some(handle);
+            pf_outbound = Some(outbound_rx);
+        }
+        Ok(Self { client, pf_inbound, pf_outbound })
+    }
+
+    /// Starts port forwarding. `sources` listen **locally** (forward
+    /// tunnels, upstream `-t`); every `DESTINATION_REQUEST` the peer sends
+    /// opens a loopback connection (reverse tunnels, upstream `-r` client
+    /// side). Peer PF frames stop surfacing in
+    /// [`TerminalSession::next_event`] and are pumped internally; bind
+    /// failures are returned like upstream's
+    /// `PortForwardSourceResponse.error` (the session stays usable).
+    pub async fn start_port_forwarding(
+        &mut self,
+        sources: Vec<PortForwardSourceRequest>,
+    ) -> Result<(), String> {
+        if self.pf_inbound.is_some() {
+            return Err("port forwarding already started".into());
+        }
+        let (inbound, outbound_rx, bind_errors) = EngineHandle::spawn(sources, true).await;
+        self.pf_outbound = Some(outbound_rx);
+        self.pf_inbound = Some(inbound);
+        if bind_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(bind_errors.join("; "))
+        }
     }
 
     /// Send raw input to the shell (`TERMINAL_BUFFER`).
@@ -182,11 +227,49 @@ impl TerminalSession {
         self.client.shutdown().await;
     }
 
-    /// Next session event; `None` after the session ended.
+    fn is_port_forward_header(header: u8) -> bool {
+        header == PORT_FORWARD_HEADER
+            || header == DESTINATION_REQUEST_HEADER
+            || header == DESTINATION_RESPONSE_HEADER
+    }
+
+    /// Next session event; `None` after the session ended. Port-forward
+    /// frames (once [`TerminalSession::start_port_forwarding`] ran) are
+    /// pumped to the engine and never surface here.
     pub async fn next_event(&mut self) -> Option<SessionEvent> {
-        match self.client.next_event().await? {
-            Event::Packet(packet) => Some(SessionEvent::from_packet(packet)),
-            Event::Dead(reason) => Some(SessionEvent::Dead(reason)),
+        loop {
+            tokio::select! {
+                biased;
+                frame = async {
+                    match &mut self.pf_outbound {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match frame {
+                        Some(packet) => {
+                            // Best-effort, like upstream writePacket: the
+                            // backed writer buffers while disconnected.
+                            let header = packet.header();
+                            let payload = packet.into_payload();
+                            let _ = self.client.write(header, payload).await;
+                        }
+                        None => self.pf_outbound = None,
+                    }
+                }
+                event = self.client.next_event() => match event? {
+                    Event::Packet(packet) => {
+                        if Self::is_port_forward_header(packet.header()) {
+                            if let Some(inbound) = &self.pf_inbound {
+                                inbound.send(packet);
+                                continue;
+                            }
+                        }
+                        return Some(SessionEvent::from_packet(packet));
+                    }
+                    Event::Dead(reason) => return Some(SessionEvent::Dead(reason)),
+                },
+            }
         }
     }
 }

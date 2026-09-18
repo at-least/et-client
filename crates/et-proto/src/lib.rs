@@ -19,6 +19,7 @@
 
 pub mod backed;
 pub mod crypto;
+pub mod forward;
 pub mod framing;
 pub mod gen;
 pub mod ids;

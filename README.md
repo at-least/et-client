@@ -149,12 +149,20 @@ cargo test --test cpp_interop -- --ignored   # against real C++ binaries
   verified manually; the command the C++ client runs over ssh is
   byte-identical to what `et_client::ssh::etterminal_command` produces.
 
+## Port forwarding
+
+`et -t 18000:8000,2222:22 user@host` and `et -r 5037:5037 user@host` are
+implemented (TCP ports; the range syntax `a-b:c-d`, comma lists, and ssh-style
+`bind:port:host:hostport` all parse like upstream `TunnelUtils`). The engine
+lives in `et_proto::forward` and runs identically on both roles: sources bind
+locally and emit `DESTINATION_REQUEST`s; destinations connect `::1` then
+`127.0.0.1` like upstream (the destination *name* is ignored for TCP).
+Unix-socket forwarding (`ENV:/path`, SSH agent) is not supported — the parser
+accepts those forms but the CLI and engine reject them with a clear error.
+Interop tests cover both directions against the C++ etserver.
+
 ## Not implemented (deliberately)
 
-- **Port forwarding** (`-t`/`-r`): the packet types exist and etserver
-  relays them as ciphertext (its job ends there), but the client-side and
-  etterminal-side handlers are not written. The CLI rejects the flags
-  loudly rather than half-working.
 - **Jumphost** (`--jump` mode): refused by the CLI and etterminal. Upstream
   compatibility of the *terminal* path is unaffected.
 - Windows. The unix leg and PTY layer are unix-only by design.

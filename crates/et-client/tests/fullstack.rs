@@ -11,6 +11,7 @@ use std::time::Duration;
 use et_client::session::{SessionEvent, TerminalSession, DEFAULT_KEEPALIVE};
 use buffa::Message as _;
 use et_proto::{ConnectRequest, InitialPayload};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use et_proto::PROTOCOL_VERSION;
 
 /// A non-`XXX` id (so etterminal does not regenerate) with a 32-char
@@ -375,6 +376,137 @@ async fn initial_connect_retries_until_terminal_registers() {
             }
         }
     }
+}
+
+/// ECHO server on an ephemeral port; returns the port.
+async fn spawn_echo_listener() -> u16 {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+fn free_tcp_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn tunnel_request(source_port: u16, destination_port: u16) -> et_proto::PortForwardSourceRequest {
+    et_proto::PortForwardSourceRequest {
+        source: et_proto::SocketEndpoint {
+            name: Some("127.0.0.1".into()),
+            port: Some(source_port as i32),
+            ..Default::default()
+        }
+        .into(),
+        destination: et_proto::SocketEndpoint {
+            name: None,
+            port: Some(destination_port as i32),
+            ..Default::default()
+        }
+        .into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn forward_tunnel_round_trip() {
+    let (id, passkey) = test_id_passkey();
+    let stack = start_stack(&id, &passkey).await;
+    let echo_port = spawn_echo_listener().await;
+    let client_port = free_tcp_port();
+
+    let mut session = connect(&stack, &id, &passkey).await;
+    session
+        .start_port_forwarding(vec![tunnel_request(client_port, echo_port)])
+        .await
+        .unwrap();
+
+    // Pump the session while we use the tunnel.
+    let pump = tokio::spawn(async move {
+        loop {
+            if session.next_event().await.is_none() {
+                return;
+            }
+        }
+    });
+
+    let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", client_port))
+        .await
+        .expect("connect to forwarded port");
+    conn.write_all(b"PING42").await.unwrap();
+    let mut buf = [0u8; 6];
+    tokio::time::timeout(Duration::from_secs(10), conn.read_exact(&mut buf))
+        .await
+        .expect("echo timeout")
+        .unwrap();
+    assert_eq!(&buf, b"PING42");
+    pump.abort();
+}
+
+#[tokio::test]
+async fn reverse_tunnel_round_trip() {
+    let (id, passkey) = test_id_passkey();
+    let stack = start_stack(&id, &passkey).await;
+    // The CLIENT side hosts the destination (echo); the SERVER side listens.
+    let client_echo_port = spawn_echo_listener().await;
+    let server_listen_port = free_tcp_port();
+
+    let payload = InitialPayload {
+        reversetunnels: vec![tunnel_request(server_listen_port, client_echo_port)],
+        ..Default::default()
+    };
+    let mut session = TerminalSession::start(
+        format!("127.0.0.1:{}", stack.port),
+        id.clone(),
+        &passkey,
+        &payload,
+        DEFAULT_KEEPALIVE,
+    )
+    .await
+    .expect("session with reverse tunnel");
+
+    let pump = tokio::spawn(async move {
+        loop {
+            if session.next_event().await.is_none() {
+                return;
+            }
+        }
+    });
+
+    // Connect to the SERVER-side listener; traffic relays to the client
+    // echo server and back.
+    let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", server_listen_port))
+        .await
+        .expect("connect to reverse-tunnel listener");
+    conn.write_all(b"REV77").await.unwrap();
+    let mut buf = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(10), conn.read_exact(&mut buf))
+        .await
+        .expect("echo timeout")
+        .unwrap();
+    assert_eq!(&buf, b"REV77");
+    pump.abort();
 }
 
 #[tokio::test]

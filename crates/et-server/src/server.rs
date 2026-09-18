@@ -278,6 +278,30 @@ async fn run_session(
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
+    // Port forwarding. Upstream etserver always runs the handler here (the
+    // terminal never sees PF frames): reverse tunnels (upstream `-r`) bind
+    // server-side listeners before INITIAL_RESPONSE, and any bind failure
+    // rejects the session with the INITIAL_RESPONSE error string, exactly
+    // like upstream runTerminal. Forward tunnels need a live handler even
+    // with no reversetunnels configured.
+    let (pf_inbound, pf_outbound, bind_errors) =
+        et_proto::forward::EngineHandle::spawn(payload.reversetunnels.clone(), true).await;
+    let mut pf_outbound = Some(pf_outbound);
+    if !payload.reversetunnels.is_empty() && !bind_errors.is_empty() {
+        let response = et_proto::InitialResponse {
+            error: Some(format!(
+                "could not establish reverse tunnels: {}",
+                bind_errors.join("; ")
+            )),
+            ..Default::default()
+        };
+        let _ = conn
+            .write(et_packet_type::INITIAL_RESPONSE, response.encode_to_vec())
+            .await;
+        cleanup(&router, &id, &conn);
+        return;
+    }
+
     // Upstream `ServerClientConnection::verifyPasskey`.
     if !crate::router::verify_passkey(&key, &terminal_info.passkey) {
         eprintln!("etserver: passkey mismatch for {id}");
@@ -323,6 +347,21 @@ async fn run_session(
     let mut chunk = [0u8; TERMINAL_CHUNK];
     loop {
         tokio::select! {
+            pf_frame = async {
+                match &mut pf_outbound {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => match pf_frame {
+                Some(packet) => {
+                    let header = packet.header();
+                    let payload = packet.into_payload();
+                    if conn.write(header, payload).await.is_err() {
+                        break;
+                    }
+                }
+                None => pf_outbound = None,
+            },
             event = events.recv() => match event {
                 Some(BackedEvent::Packet(packet)) => {
                     match packet.header() {
@@ -344,9 +383,10 @@ async fn run_session(
                         terminal_packet_type::PORT_FORWARD_DATA
                         | terminal_packet_type::PORT_FORWARD_DESTINATION_REQUEST
                         | terminal_packet_type::PORT_FORWARD_DESTINATION_RESPONSE => {
-                            // Port forwarding is not implemented in this
-                            // port; frames are dropped (documented in the
-                            // README).
+                            // Forward-tunnel traffic: the engine opens the
+                            // destinations (upstream runs the same handler
+                            // inside etserver, never etterminal).
+                            pf_inbound.send(packet);
                         }
                         _ => {}
                     }

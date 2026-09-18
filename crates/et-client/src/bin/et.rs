@@ -26,6 +26,8 @@ struct Cli {
     keepalive: Duration,
     term_opts: TerminalCommandOptions,
     server_fifo: Option<String>,
+    forward_sources: Vec<et_proto::PortForwardSourceRequest>,
+    reverse_sources: Vec<et_proto::PortForwardSourceRequest>,
 }
 
 fn usage() -> &'static str {
@@ -42,6 +44,8 @@ fn parse_args() -> Result<Cli, String> {
     let mut term_opts = TerminalCommandOptions::default();
     let mut server_fifo = None;
     let mut positional: Option<String> = None;
+    let mut forward_sources: Vec<et_proto::PortForwardSourceRequest> = Vec::new();
+    let mut reverse_sources: Vec<et_proto::PortForwardSourceRequest> = Vec::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -56,12 +60,17 @@ fn parse_args() -> Result<Cli, String> {
                     .map_err(|_| "--keepalive needs a number")?;
                 keepalive = Duration::from_secs(secs);
             }
-            "-t" | "--tunnel" | "-r" | "--reversetunnel" => {
-                let _ = args.next();
-                return Err(format!(
-                    "{arg}: port forwarding is not implemented in this build \
-                     (documented in the README)"
-                ));
+            "-t" | "--tunnel" => {
+                let spec = args.next().ok_or("-t needs a value")?;
+                let parsed = et_proto::forward::parse_ranges(&spec)
+                    .map_err(|e| format!("-t {spec}: {e}"))?;
+                forward_sources.extend(parsed);
+            }
+            "-r" | "--reversetunnel" => {
+                let spec = args.next().ok_or("-r needs a value")?;
+                let parsed = et_proto::forward::parse_ranges(&spec)
+                    .map_err(|e| format!("-r {spec}: {e}"))?;
+                reverse_sources.extend(parsed);
             }
             "--jumphost" | "-J" => {
                 return Err(
@@ -134,6 +143,8 @@ fn parse_args() -> Result<Cli, String> {
         keepalive,
         term_opts,
         server_fifo,
+        forward_sources,
+        reverse_sources,
     })
 }
 
@@ -169,8 +180,10 @@ async fn main() -> std::process::ExitCode {
     // The server may have regenerated both values (the "XXX" convention).
     let idpasskey = if idpasskey.id.is_empty() { fresh } else { idpasskey };
 
-    // 2. Connect and run the terminal session.
+    // 2. Connect and run the terminal session. Reverse tunnels ride the
+    // INITIAL_PAYLOAD (the server binds its listeners before answering).
     let payload = InitialPayload {
+        reversetunnels: cli.reverse_sources.clone(),
         jumphost: Some(false),
         environmentvariables: [(
             "ET_VERSION".to_string(),
@@ -201,6 +214,14 @@ async fn main() -> std::process::ExitCode {
     // Initial window size; resizes follow via events.
     if let Ok((cols, rows)) = crossterm::terminal::size() {
         let _ = session.send_terminal_info(rows as i32, cols as i32, 0, 0).await;
+    }
+
+    // Forward tunnels: local listeners; failures warn and continue, like
+    // upstream's "Failed to establish port forward".
+    if !cli.forward_sources.is_empty() {
+        if let Err(errors) = session.start_port_forwarding(cli.forward_sources.clone()).await {
+            eprintln!("et: port forward warning: {errors}");
+        }
     }
 
     // Optional remote command (upstream appends "; exit" unless --no-exit).
