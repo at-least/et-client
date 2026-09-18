@@ -3,8 +3,8 @@
 //! Everything here is **pure** — no process is spawned, no trait must be
 //! implemented — so conch can drive the handshake over its own SSH
 //! transport (russh): build the command string, run it remotely, feed the
-//! collected output back into [`parse_idpasskey_output`]. The `et` CLI does
-//! exactly this with the system `ssh` binary ([`run_ssh_handshake`]).
+//! collected output back into [`parse_idpasskey_output`]. [`run_ssh_handshake`]
+//! is the reference transport using the system `ssh` binary.
 
 use crate::protocol::DEFAULT_TERMINAL;
 use et_proto::ids::{ID_LEN, PASSKEY_LEN};
@@ -80,8 +80,8 @@ pub struct SshDestination {
     pub user: String,
     pub host: String,
     pub port: Option<u16>,
-    /// `--jumphost` value upstream (`-J`); jump support is not implemented in
-    /// this port yet, the field is carried for CLI compatibility.
+    /// `--jumphost` value upstream (`-J`); an `ssh -J` transport dials the
+    /// destination through this jump host during the handshake.
     pub jumphost: Option<String>,
     /// Extra `-o` options (upstream `--ssh-option`).
     pub ssh_options: Vec<String>,
