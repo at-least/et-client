@@ -277,3 +277,252 @@ fn key_bytes(passkey: &str) -> Option<[u8; 32]> {
     key.copy_from_slice(bytes);
     Some(key)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framing::{read_framed_packet, read_proto_frame, write_framed_packet, write_proto_frame};
+    use crate::gen::et::{CatchupBuffer, SequenceHeader};
+    use crate::{DEFAULT_MAX_PROTO_LENGTH, MAX_PACKET_LENGTH};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    const ID: &str = "XXXabcdefghijklmnop";
+    const PASSKEY: &str = "0123456789abcdef0123456789abcdef";
+    const KEEPALIVE: Keepalive = Some(Duration::from_secs(5));
+    const LONG: Duration = Duration::from_secs(5);
+
+    struct ServerRig {
+        listener: Arc<TcpListener>,
+        addr: SocketAddr,
+    }
+
+    async fn server_rig() -> ServerRig {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        ServerRig { listener: Arc::new(listener), addr }
+    }
+
+    async fn connect(rig: &ServerRig) -> Result<EtClient, ConnectFailure> {
+        EtClient::connect_with(rig.addr.to_string(), ID.to_string(), PASSKEY, KEEPALIVE).await
+    }
+
+    /// Accepts one connection, consumes the ConnectRequest, answers
+    /// `status`, and returns the peer end for data-plane interaction.
+    async fn accept_handshake(listener: &TcpListener, status: ConnectStatus) -> TcpStream {
+        let (mut peer, _) = listener.accept().await.unwrap();
+        peer.set_nodelay(true).ok();
+        let bytes = read_proto_frame(&mut peer, MAX_HANDSHAKE_PROTO_LENGTH).await.unwrap();
+        let request = ConnectRequest::decode_from_slice(&bytes).unwrap();
+        assert_eq!(request.clientId.as_deref(), Some(ID));
+        assert_eq!(request.version, Some(PROTOCOL_VERSION));
+        let response =
+            ConnectResponse { status: Some(status), error: None, ..Default::default() };
+        write_proto_frame(&mut peer, &response.encode_to_vec()).await.unwrap();
+        peer
+    }
+
+    /// One scripted handshake as its own task; the receiver resolves once
+    /// the reply is on the wire. Only safe when no other task accepts from
+    /// the same listener concurrently — otherwise accepts race. For ordered
+    /// multi-connection scripts, call [`accept_handshake`] sequentially
+    /// inside one task instead.
+    fn spawn_handshake(rig: &ServerRig, status: ConnectStatus) -> oneshot::Receiver<TcpStream> {
+        let listener = rig.listener.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = tx.send(accept_handshake(&listener, status).await);
+        });
+        rx
+    }
+
+    struct PeerCrypto {
+        writer: crate::crypto::CryptoHandler,
+        reader: crate::crypto::CryptoHandler,
+    }
+
+    fn peer_crypto() -> PeerCrypto {
+        let key = key_bytes(PASSKEY).unwrap();
+        PeerCrypto {
+            writer: crate::crypto::CryptoHandler::new(&key, SERVER_CLIENT_NONCE_MSB),
+            reader: crate::crypto::CryptoHandler::new(&key, CLIENT_SERVER_NONCE_MSB),
+        }
+    }
+
+    async fn read_client_packet(
+        peer: &mut TcpStream,
+        reader: &mut crate::crypto::CryptoHandler,
+    ) -> Packet {
+        let mut packet = read_framed_packet(peer, MAX_PACKET_LENGTH).await.unwrap();
+        assert!(packet.is_encrypted());
+        packet.decrypt(reader).unwrap();
+        packet
+    }
+
+    async fn send_peer_packet(
+        peer: &mut TcpStream,
+        writer: &mut crate::crypto::CryptoHandler,
+        header: u8,
+        payload: &[u8],
+    ) {
+        let mut packet = Packet::new(header, payload.to_vec());
+        packet.encrypt(writer);
+        write_framed_packet(peer, &packet).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_passkeys_that_are_not_32_bytes() {
+        let rig = server_rig().await;
+        let err = match
+            EtClient::connect_with(rig.addr.to_string(), ID.into(), "short", KEEPALIVE).await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a short passkey must be rejected"),
+        };
+        assert!(
+            matches!(err, ConnectFailure::Protocol(ref m) if m.contains("32 bytes")),
+            "{err}"
+        );
+    }
+
+    /// `RETURNING_CLIENT` on an *initial* connect means a live session
+    /// already owns this id: fail fast instead of wedging like upstream.
+    #[tokio::test]
+    async fn returning_client_on_initial_connect_fails_fast() {
+        let rig = server_rig().await;
+        let rx = spawn_handshake(&rig, ConnectStatus::ReturningClient);
+        let err = match connect(&rig).await {
+            Err(e) => e,
+            Ok(_) => panic!("an id with a live session must be rejected"),
+        };
+        let _ = rx.await;
+        assert!(
+            matches!(err, ConnectFailure::Protocol(ref m) if m.contains("already has a live session")),
+            "{err}"
+        );
+    }
+
+    /// Reconnect answered `NEW_CLIENT`: the server kept the key but lost
+    /// the connection state, the streams can never resynchronize, and the
+    /// session ends with `ServerStateLost`.
+    #[tokio::test]
+    async fn reconnect_answered_new_client_ends_the_session() {
+        let rig = server_rig().await;
+        let rx1 = spawn_handshake(&rig, ConnectStatus::NewClient);
+        let mut client = connect(&rig).await.unwrap();
+        let mut peer1 = rx1.await.unwrap();
+        let mut pc = peer_crypto();
+
+        client.write(1, b"hi".to_vec()).await.unwrap();
+        let packet = read_client_packet(&mut peer1, &mut pc.reader).await;
+        assert_eq!(packet.payload(), b"hi");
+
+        drop(peer1);
+        let rx2 = spawn_handshake(&rig, ConnectStatus::NewClient);
+        let _peer2 = rx2.await.unwrap();
+        match timeout(LONG, client.next_event()).await.unwrap() {
+            Some(Event::Dead(ClientDeadReason::ServerStateLost)) => {}
+            other => panic!("expected Dead(ServerStateLost), got {other:?}"),
+        }
+        assert!(client.next_event().await.is_none(), "the channel closes afterwards");
+    }
+
+    /// Reconnect answered `INVALID_KEY`: the server tore the session down;
+    /// the supervisor reports the death and shuts the backed layer down.
+    #[tokio::test]
+    async fn reconnect_answered_invalid_key_ends_the_session() {
+        let rig = server_rig().await;
+        let rx1 = spawn_handshake(&rig, ConnectStatus::NewClient);
+        let mut client = connect(&rig).await.unwrap();
+        let mut peer1 = rx1.await.unwrap();
+        let mut pc = peer_crypto();
+
+        client.write(1, b"hi".to_vec()).await.unwrap();
+        let packet = read_client_packet(&mut peer1, &mut pc.reader).await;
+        assert_eq!(packet.payload(), b"hi");
+
+        drop(peer1);
+        let rx2 = spawn_handshake(&rig, ConnectStatus::InvalidKey);
+        let _ = rx2.await.unwrap();
+        match timeout(LONG, client.next_event()).await.unwrap() {
+            Some(Event::Dead(ClientDeadReason::InvalidKey)) => {}
+            other => panic!("expected Dead(InvalidKey), got {other:?}"),
+        }
+        assert_eq!(
+            client.write(1, b"x".to_vec()).await,
+            Err(WriteError::Shutdown),
+            "the supervisor shut the backed layer down"
+        );
+        assert!(client.next_event().await.is_none());
+    }
+
+    /// A dropped socket, one retryable handshake failure
+    /// (`MISMATCHED_PROTOCOL`), then `RETURNING_CLIENT` with the recover
+    /// exchange: the session comes back on the new socket with the undelivered
+    /// packet resent as identical ciphertext, both nonce streams unbroken.
+    #[tokio::test]
+    async fn reconnect_retries_then_recovers_on_returning_client() {
+        let rig = server_rig().await;
+        let rx1 = spawn_handshake(&rig, ConnectStatus::NewClient);
+        let mut client = connect(&rig).await.unwrap();
+        let mut peer1 = rx1.await.unwrap();
+        let mut pc = peer_crypto();
+
+        client.write(1, b"pre".to_vec()).await.unwrap();
+        let pre = {
+            // Serialize before decrypting: the backup stores ciphertext.
+            let wire = read_framed_packet(&mut peer1, MAX_PACKET_LENGTH).await.unwrap();
+            let bytes = wire.serialize();
+            let mut packet = wire;
+            packet.decrypt(&mut pc.reader).unwrap();
+            assert_eq!(packet.payload(), b"pre");
+            bytes
+        };
+
+        drop(peer1);
+        // One task owns every later accept in arrival order (concurrent
+        // acceptors would race): attempt #2 gets a retryable
+        // MISMATCHED_PROTOCOL; attempt #3, after the supervisor's 1 s
+        // backoff, returns the session via the recover exchange.
+        let listener = rig.listener.clone();
+        let exchange = tokio::spawn(async move {
+            accept_handshake(&listener, ConnectStatus::MismatchedProtocol).await;
+            let mut peer3 = accept_handshake(&listener, ConnectStatus::ReturningClient).await;
+            let bytes = read_proto_frame(&mut peer3, MAX_HANDSHAKE_PROTO_LENGTH).await.unwrap();
+            let sh = SequenceHeader::decode_from_slice(&bytes).unwrap();
+            assert_eq!(sh.sequenceNumber, Some(0), "the peer delivered nothing");
+            write_proto_frame(
+                &mut peer3,
+                &SequenceHeader { sequenceNumber: Some(0), ..Default::default() }.encode_to_vec(),
+            )
+            .await
+            .unwrap();
+            let bytes = read_proto_frame(&mut peer3, DEFAULT_MAX_PROTO_LENGTH).await.unwrap();
+            let catchup = CatchupBuffer::decode_from_slice(&bytes).unwrap();
+            write_proto_frame(&mut peer3, &CatchupBuffer::default().encode_to_vec())
+                .await
+                .unwrap();
+            (peer3, catchup.buffer)
+        });
+
+        let (mut peer3, entries) = exchange.await.unwrap();
+        assert_eq!(entries.len(), 1, "the packet from the dead socket is resent");
+        assert_eq!(entries[0], pre, "catch-up resends identical ciphertext");
+
+        client.write(2, b"post".to_vec()).await.unwrap();
+        let packet = read_client_packet(&mut peer3, &mut pc.reader).await;
+        assert_eq!(packet.header(), 2);
+        assert_eq!(packet.payload(), b"post");
+
+        send_peer_packet(&mut peer3, &mut pc.writer, 3, b"down").await;
+        match timeout(LONG, client.next_event()).await.unwrap() {
+            Some(Event::Packet(packet)) => {
+                assert_eq!(packet.header(), 3);
+                assert_eq!(packet.payload(), b"down");
+            }
+            other => panic!("expected a packet on the recovered session, got {other:?}"),
+        }
+    }
+}

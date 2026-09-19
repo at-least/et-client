@@ -147,7 +147,11 @@ interop tests, and clippy inside it, validating the Linux build.
   and forward + reverse tunnels, plus the all-C++ jumphost chain
   (C++ etserver → C++ `etterminal --jump` → C++ etserver → C++ etterminal).
   With the Rust server removed, these are also the client's behavioural
-  net; `cargo test` alone covers encodings (golden) and pure functions.
+  net; `cargo test` alone covers encodings (golden), pure functions, and
+  the connection layer's behaviour (recover exchanges, reconnect endings,
+  keepalive, tunnel engine) against in-process mock peers. Wire
+  compatibility itself stays gated by the golden bytes and the C++
+  interop tests, not by the mocks.
 
 ## Port forwarding
 

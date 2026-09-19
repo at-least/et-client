@@ -225,6 +225,9 @@ struct BackedActor {
     waiting_on_keepalive: bool,
     last_activity: Instant,
     shutting_down: bool,
+    /// Set once a terminal `Dead` event went out, so the run loop's final
+    /// send does not append a second, reason-less one.
+    dead_sent: bool,
     events_tx: mpsc::Sender<BackedEvent>,
 }
 
@@ -247,6 +250,7 @@ impl BackedActor {
             waiting_on_keepalive: false,
             last_activity: Instant::now(),
             shutting_down: false,
+            dead_sent: false,
             events_tx,
         }
     }
@@ -314,7 +318,9 @@ impl BackedActor {
         if let Some(mut live) = self.live.take() {
             live.io_rx.close();
         }
-        let _ = self.events_tx.send(BackedEvent::Dead(DeadReason::Shutdown)).await;
+        if !self.dead_sent {
+            let _ = self.events_tx.send(BackedEvent::Dead(DeadReason::Shutdown)).await;
+        }
     }
 
     async fn deliver_inbox(&mut self) {
@@ -324,6 +330,7 @@ impl BackedActor {
             // every later recover (the peer would resend the wrong span).
             let Some(mut packet) = Packet::parse(&bytes) else {
                 self.shutting_down = true;
+                self.dead_sent = true;
                 let _ = self
                     .events_tx
                     .send(BackedEvent::Dead(DeadReason::CryptoMismatch))
@@ -334,6 +341,7 @@ impl BackedActor {
                 && packet.decrypt(&mut self.reader_crypto).is_err()
             {
                 self.shutting_down = true;
+                self.dead_sent = true;
                 let _ = self
                     .events_tx
                     .send(BackedEvent::Dead(DeadReason::CryptoMismatch))
@@ -498,5 +506,493 @@ impl BackedActor {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framing::{read_framed_packet, write_framed_packet};
+    use crate::{CLIENT_SERVER_NONCE_MSB, DEFAULT_MAX_PROTO_LENGTH, MAX_PACKET_LENGTH, SERVER_CLIENT_NONCE_MSB};
+    use std::net::SocketAddr;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    const TEST_KEY: [u8; 32] = [0x5a; 32];
+    const LONG: Duration = Duration::from_secs(5);
+
+    /// The mock peer's crypto: its writer feeds the client's reader stream
+    /// (MSB 1), its reader consumes the client's writer stream (MSB 0) —
+    /// the mirror of the `BackedConfig` the rig hands the client side.
+    struct PeerCrypto {
+        writer: CryptoHandler,
+        reader: CryptoHandler,
+    }
+
+    fn peer_crypto() -> PeerCrypto {
+        PeerCrypto {
+            writer: CryptoHandler::new(&TEST_KEY, SERVER_CLIENT_NONCE_MSB),
+            reader: CryptoHandler::new(&TEST_KEY, CLIENT_SERVER_NONCE_MSB),
+        }
+    }
+
+    struct Rig {
+        listener: TcpListener,
+        addr: SocketAddr,
+        backed: BackedHandle,
+        events: mpsc::Receiver<BackedEvent>,
+    }
+
+    async fn rig(keepalive: Option<Duration>) -> Rig {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (backed, events) = BackedHandle::spawn(
+            stream,
+            BackedConfig {
+                key: TEST_KEY,
+                reader_msb: SERVER_CLIENT_NONCE_MSB,
+                writer_msb: CLIENT_SERVER_NONCE_MSB,
+                keepalive,
+            },
+        )
+        .await;
+        Rig { listener, addr, backed, events }
+    }
+
+    impl Rig {
+        /// The peer end of the live connection.
+        async fn accept(&self) -> tokio::net::TcpStream {
+            let (peer, _) = self.listener.accept().await.unwrap();
+            peer
+        }
+
+        /// A second loopback connection for recover attempts.
+        async fn connect_extra(&self) -> tokio::net::TcpStream {
+            tokio::net::TcpStream::connect(self.addr).await.unwrap()
+        }
+    }
+
+    /// What the mock peer reads off the wire from the client: one framed
+    /// packet, decrypted on the peer's reader stream.
+    async fn read_client_packet(
+        peer: &mut tokio::net::TcpStream,
+        reader: &mut CryptoHandler,
+    ) -> Packet {
+        let mut packet = read_framed_packet(peer, MAX_PACKET_LENGTH).await.unwrap();
+        assert!(packet.is_encrypted(), "client packets are always encrypted");
+        packet.decrypt(reader).unwrap();
+        packet
+    }
+
+    /// Mock peer → client: one framed, encrypted packet.
+    async fn send_peer_packet(
+        peer: &mut tokio::net::TcpStream,
+        writer: &mut CryptoHandler,
+        header: u8,
+        payload: &[u8],
+    ) {
+        let mut packet = Packet::new(header, payload.to_vec());
+        packet.encrypt(writer);
+        write_framed_packet(peer, &packet).await.unwrap();
+    }
+
+    /// Recover-exchange peer side: read the client's SequenceHeader, reply
+    /// with `remote_seq`, collect the client's CatchupBuffer, answer with
+    /// `reply_entries`. Returns (client-reported reader seq, catch-up).
+    async fn run_recover_peer(
+        peer: &mut tokio::net::TcpStream,
+        remote_seq: i32,
+        reply_entries: Vec<Vec<u8>>,
+    ) -> (i32, Vec<Vec<u8>>) {
+        let client_seq = read_reply_sequence_header(peer, remote_seq).await;
+        let bytes = read_proto_frame(peer, DEFAULT_MAX_PROTO_LENGTH).await.unwrap();
+        let catchup = CatchupBuffer::decode_from_slice(&bytes).unwrap();
+        write_proto_frame(
+            peer,
+            &CatchupBuffer { buffer: reply_entries, ..Default::default() }.encode_to_vec(),
+        )
+        .await
+        .unwrap();
+        (client_seq, catchup.buffer)
+    }
+
+    /// The exchange's first leg only, for peers whose `remote_seq` makes the
+    /// client abort *before* sending its CatchupBuffer — reading further
+    /// here would deadlock against a client that never writes again.
+    async fn read_reply_sequence_header(
+        peer: &mut tokio::net::TcpStream,
+        remote_seq: i32,
+    ) -> i32 {
+        let bytes = read_proto_frame(peer, MAX_HANDSHAKE_PROTO_LENGTH).await.unwrap();
+        let sh = SequenceHeader::decode_from_slice(&bytes).unwrap();
+        write_proto_frame(
+            peer,
+            &SequenceHeader { sequenceNumber: Some(remote_seq), ..Default::default() }
+                .encode_to_vec(),
+        )
+        .await
+        .unwrap();
+        sh.sequenceNumber.unwrap()
+    }
+
+    #[tokio::test]
+    async fn write_delivers_encrypted_and_reads_decrypt() {
+        let mut rig = rig(None).await;
+        let mut peer = rig.accept().await;
+        let mut pc = peer_crypto();
+
+        rig.backed.write(7, b"ping".to_vec()).await.unwrap();
+        let packet = read_client_packet(&mut peer, &mut pc.reader).await;
+        assert_eq!(packet.header(), 7);
+        assert_eq!(packet.payload(), b"ping");
+
+        send_peer_packet(&mut peer, &mut pc.writer, 8, b"pong").await;
+        match rig.events.recv().await {
+            Some(BackedEvent::Packet(packet)) => {
+                assert_eq!(packet.header(), 8);
+                assert_eq!(packet.payload(), b"pong");
+            }
+            other => panic!("expected a packet event, got {other:?}"),
+        }
+    }
+
+    /// The core reconnect invariant: everything written before and *during*
+    /// the outage reaches the peer on recovery as the identical pre-encrypted
+    /// bytes, in order, with the nonce stream continuing across sockets.
+    #[tokio::test]
+    async fn recover_resends_identical_ciphertext_after_disconnect() {
+        let mut rig = rig(None).await;
+        let mut peer = rig.accept().await;
+        let mut pc = peer_crypto();
+
+        rig.backed.write(1, b"alpha".to_vec()).await.unwrap();
+        let first_bytes = {
+            // Serialize before decrypting: the backup stores ciphertext.
+            let wire = read_framed_packet(&mut peer, MAX_PACKET_LENGTH).await.unwrap();
+            let bytes = wire.serialize();
+            let mut packet = wire;
+            packet.decrypt(&mut pc.reader).unwrap();
+            assert_eq!(packet.payload(), b"alpha");
+            bytes
+        };
+        rig.backed.write(2, b"beta".to_vec()).await.unwrap();
+        let second_bytes = {
+            let wire = read_framed_packet(&mut peer, MAX_PACKET_LENGTH).await.unwrap();
+            let bytes = wire.serialize();
+            let mut packet = wire;
+            packet.decrypt(&mut pc.reader).unwrap();
+            assert_eq!(packet.payload(), b"beta");
+            bytes
+        };
+
+        rig.backed.kill_socket().await;
+        assert!(matches!(rig.events.recv().await, Some(BackedEvent::SocketDown)));
+        // Writes while disconnected: buffered, still Ok (BUFFERED_ONLY).
+        rig.backed.write(3, b"gamma".to_vec()).await.unwrap();
+        rig.backed.write(4, b"delta".to_vec()).await.unwrap();
+
+        // The client hands `recover` the client end; the mock drives the
+        // accepted (peer) end of the *same* connection.
+        let recover_stream = rig.connect_extra().await;
+        let mut peer2 = rig.accept().await;
+        let exchange = tokio::spawn(async move {
+            let (client_seq, entries) = run_recover_peer(&mut peer2, 0, Vec::new()).await;
+            (peer2, client_seq, entries)
+        });
+        assert!(rig.backed.recover(recover_stream).await);
+
+        let (mut peer2, client_seq, entries) = exchange.await.unwrap();
+        assert_eq!(client_seq, 0, "the peer sent nothing, so the client read 0 packets");
+        assert_eq!(entries.len(), 4, "everything ever written, connected or not");
+        assert_eq!(entries[0], first_bytes, "catch-up resends identical bytes");
+        assert_eq!(entries[1], second_bytes);
+        for (entry, (header, payload)) in entries[2..]
+            .iter()
+            .zip([(3, &b"gamma"[..]), (4, &b"delta"[..])])
+        {
+            let mut packet = Packet::parse(entry).unwrap();
+            packet.decrypt(&mut pc.reader).unwrap();
+            assert_eq!(packet.header(), header);
+            assert_eq!(packet.payload(), payload);
+        }
+
+        // Both directions live on the new socket, nonce streams unbroken.
+        send_peer_packet(&mut peer2, &mut pc.writer, 5, b"echo").await;
+        match rig.events.recv().await {
+            Some(BackedEvent::Packet(packet)) => {
+                assert_eq!(packet.header(), 5);
+                assert_eq!(packet.payload(), b"echo");
+            }
+            other => panic!("expected a packet event after recover, got {other:?}"),
+        }
+        rig.backed.write(6, b"post".to_vec()).await.unwrap();
+        let packet = read_client_packet(&mut peer2, &mut pc.reader).await;
+        assert_eq!(packet.header(), 6);
+        assert_eq!(packet.payload(), b"post");
+    }
+
+    /// `recoverClient`'s victim protection: a recover exchange that fails
+    /// mid-way must leave the live socket untouched and working.
+    #[tokio::test]
+    async fn failed_recover_leaves_live_socket_untouched() {
+        let mut rig = rig(None).await;
+        let mut peer = rig.accept().await;
+        let mut pc = peer_crypto();
+
+        rig.backed.write(1, b"before".to_vec()).await.unwrap();
+        let packet = read_client_packet(&mut peer, &mut pc.reader).await;
+        assert_eq!(packet.payload(), b"before");
+
+        // A bogus stream: connected, then dropped mid-exchange.
+        let bogus = rig.connect_extra().await;
+        let dead_peer = rig.accept().await;
+        drop(dead_peer);
+        assert!(!rig.backed.recover(bogus).await, "the exchange must fail");
+
+        // The original socket still carries traffic both ways, and no
+        // SocketDown was invented for it.
+        rig.backed.write(2, b"after".to_vec()).await.unwrap();
+        let packet = read_client_packet(&mut peer, &mut pc.reader).await;
+        assert_eq!(packet.header(), 2);
+        assert_eq!(packet.payload(), b"after");
+        assert!(
+            timeout(Duration::from_millis(150), rig.events.recv()).await.is_err(),
+            "a failed recover must not emit SocketDown for the live socket"
+        );
+    }
+
+    /// A peer that claims to have received more of our packets than we ever
+    /// sent (`writer_seq - remote_seq < 0`) fails the exchange instead of
+    /// underflowing, and the session stays disconnected-but-alive.
+    #[tokio::test]
+    async fn recover_rejects_peer_claiming_unsent_packets() {
+        let mut rig = rig(None).await;
+        let mut peer = rig.accept().await;
+        let mut pc = peer_crypto();
+
+        rig.backed.write(1, b"one".to_vec()).await.unwrap();
+        read_client_packet(&mut peer, &mut pc.reader).await;
+        rig.backed.write(2, b"two".to_vec()).await.unwrap();
+        read_client_packet(&mut peer, &mut pc.reader).await;
+
+        rig.backed.kill_socket().await;
+        assert!(matches!(rig.events.recv().await, Some(BackedEvent::SocketDown)));
+
+        let recover_stream = rig.connect_extra().await;
+        let mut peer2 = rig.accept().await;
+        let exchange = tokio::spawn(async move {
+            let client_seq = read_reply_sequence_header(&mut peer2, 5).await;
+            (peer2, client_seq)
+        });
+        assert!(!rig.backed.recover(recover_stream).await);
+        let (_, client_seq) = exchange.await.unwrap();
+        assert_eq!(client_seq, 0);
+
+        // Still disconnected: writes buffer instead of erroring.
+        assert_eq!(rig.backed.write(3, b"three".to_vec()).await, Ok(()));
+    }
+
+    /// While connected the backup is trimmed to `MAX_BACKUP_BYTES`, so a
+    /// peer that fell further behind than the trim window cannot be
+    /// revived — and the failure must not wedge the session.
+    #[tokio::test]
+    async fn backup_trimmed_while_connected_rejects_far_behind_peer() {
+        let mut rig = rig(None).await;
+        let _peer = rig.accept().await;
+        const MIB: usize = 1024 * 1024;
+        for i in 0..70usize {
+            rig.backed.write(1, vec![i as u8; MIB]).await.unwrap();
+        }
+        rig.backed.kill_socket().await;
+        assert!(matches!(rig.events.recv().await, Some(BackedEvent::SocketDown)));
+
+        let recover_stream = rig.connect_extra().await;
+        let mut peer2 = rig.accept().await;
+        let exchange = tokio::spawn(async move {
+            let client_seq = read_reply_sequence_header(&mut peer2, 0).await;
+            (peer2, client_seq)
+        });
+        assert!(
+            !rig.backed.recover(recover_stream).await,
+            "70 MiB written but only ~64 MiB kept: the peer is too far behind"
+        );
+        let (_, client_seq) = exchange.await.unwrap();
+        assert_eq!(client_seq, 0);
+
+        // Disconnected-but-alive: the failed recover changed nothing.
+        assert_eq!(rig.backed.write(2, b"still here".to_vec()).await, Ok(()));
+    }
+
+    /// While disconnected nothing is trimmed: every buffered write (up to
+    /// the disconnect buffer's own cap) reaches the peer on recovery, in
+    /// order, as the identical pre-encrypted bytes.
+    #[tokio::test]
+    async fn offline_writes_beyond_backup_limit_survive_until_recover() {
+        let mut rig = rig(None).await;
+        let _peer = rig.accept().await;
+        rig.backed.kill_socket().await;
+        assert!(matches!(rig.events.recv().await, Some(BackedEvent::SocketDown)));
+
+        const MIB: usize = 1024 * 1024;
+        for i in 0..60usize {
+            rig.backed.write(1, vec![i as u8; MIB]).await.unwrap();
+        }
+
+        let recover_stream = rig.connect_extra().await;
+        let mut peer2 = rig.accept().await;
+        let exchange = tokio::spawn(async move {
+            let (client_seq, entries) = run_recover_peer(&mut peer2, 0, Vec::new()).await;
+            (peer2, client_seq, entries)
+        });
+        assert!(rig.backed.recover(recover_stream).await);
+        let (mut peer2, client_seq, entries) = exchange.await.unwrap();
+        assert_eq!(client_seq, 0);
+        assert_eq!(entries.len(), 60, "no trimming while disconnected");
+
+        let mut reader = peer_crypto().reader;
+        for (i, entry) in entries.iter().enumerate() {
+            let mut packet = Packet::parse(entry).unwrap();
+            packet.decrypt(&mut reader).unwrap();
+            assert_eq!(packet.header(), 1);
+            assert_eq!(packet.payload().len(), MIB);
+            assert_eq!(packet.payload()[0], i as u8, "delivery order must be chronological");
+        }
+
+        // Back to live: traffic flows on the new socket.
+        rig.backed.write(2, b"live".to_vec()).await.unwrap();
+        let packet = read_client_packet(&mut peer2, &mut reader).await;
+        assert_eq!(packet.payload(), b"live");
+    }
+
+    /// `BackedWriter::write` on a full disconnect buffer: the write that
+    /// exactly reaches the limit is buffered (BUFFERED_ONLY), the next is
+    /// SKIPPED, and the skipped write leaves backup/sequence consistent.
+    #[tokio::test]
+    async fn disconnect_buffer_overflow_skips_writes_without_corrupting_state() {
+        let mut rig = rig(None).await;
+        let _peer = rig.accept().await;
+        let mut pc = peer_crypto();
+        rig.backed.kill_socket().await;
+        assert!(matches!(rig.events.recv().await, Some(BackedEvent::SocketDown)));
+
+        let big = vec![0u8; DISCONNECT_BUFFER_BYTES as usize];
+        assert_eq!(rig.backed.write(1, big).await, Ok(()), "exactly at the limit still buffers");
+        assert_eq!(
+            rig.backed.write(2, b"x".to_vec()).await,
+            Err(WriteError::Skipped),
+            "one byte past the limit is skipped"
+        );
+
+        // The skipped write must not have advanced anything: recovery
+        // resends exactly the one real packet, and post-recover traffic
+        // continues the nonce stream without a gap.
+        let recover_stream = rig.connect_extra().await;
+        let mut peer2 = rig.accept().await;
+        let exchange = tokio::spawn(async move {
+            let (client_seq, entries) = run_recover_peer(&mut peer2, 0, Vec::new()).await;
+            (peer2, client_seq, entries)
+        });
+        assert!(rig.backed.recover(recover_stream).await);
+        let (mut peer2, client_seq, entries) = exchange.await.unwrap();
+        assert_eq!(client_seq, 0, "the client read nothing from the peer");
+        assert_eq!(entries.len(), 1, "only the real packet is in the backup");
+        let mut big_packet = Packet::parse(&entries[0]).unwrap();
+        big_packet.decrypt(&mut pc.reader).unwrap();
+        assert_eq!(big_packet.payload().len(), DISCONNECT_BUFFER_BYTES as usize);
+
+        rig.backed.write(3, b"live".to_vec()).await.unwrap();
+        let packet = read_client_packet(&mut peer2, &mut pc.reader).await;
+        assert_eq!(packet.header(), 3);
+        assert_eq!(packet.payload(), b"live");
+    }
+
+    /// A frame the parser or the MAC rejects is protocol corruption: the
+    /// session dies with `CryptoMismatch` (rather than skipping a frame and
+    /// desynchronizing every later recover), then writes report shutdown.
+    #[tokio::test]
+    async fn corrupt_frame_kills_session_with_crypto_mismatch() {
+        // [encrypted=1, header] + 16 junk bytes: parses, fails the MAC.
+        let bad_mac = vec![
+            1u8, 7, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+            0x42, 0x42, 0x42,
+        ];
+        // A single byte cannot even parse as a packet.
+        let unparseable = vec![0xABu8];
+        for frame in [bad_mac, unparseable] {
+            let mut rig = rig(None).await;
+            let mut peer = rig.accept().await;
+            let len = frame.len() as u32;
+            peer.write_all(&len.to_be_bytes()).await.unwrap();
+            peer.write_all(&frame).await.unwrap();
+
+            match rig.events.recv().await {
+                Some(BackedEvent::Dead(DeadReason::CryptoMismatch)) => {}
+                other => panic!("expected Dead(CryptoMismatch), got {other:?}"),
+            }
+            assert_eq!(rig.backed.write(1, b"x".to_vec()).await, Err(WriteError::Shutdown));
+            // The Dead event is the *only* terminal event: the channel then
+            // closes without a second, reason-less Dead.
+            assert!(rig.events.recv().await.is_none());
+        }
+    }
+
+    /// Dropping every handle is a shutdown: the actor drains, reports
+    /// `Dead(Shutdown)` once, and closes the event channel.
+    #[tokio::test]
+    async fn dropping_all_handles_ends_the_actor() {
+        let mut rig = rig(None).await;
+        let _peer = rig.accept().await;
+        drop(rig.backed);
+        assert!(matches!(rig.events.recv().await, Some(BackedEvent::Dead(DeadReason::Shutdown))));
+        assert!(rig.events.recv().await.is_none());
+    }
+
+    /// Idle past the keepalive period makes the client send an encrypted
+    /// KEEP_ALIVE; the peer's echo clears the outstanding flag, so the next
+    /// tick pings again instead of killing the socket.
+    #[tokio::test]
+    async fn keepalive_pings_when_idle_and_echo_keeps_the_socket_alive() {
+        let rig = rig(Some(Duration::from_millis(100))).await;
+        let mut peer = rig.accept().await;
+        let mut pc = peer_crypto();
+
+        // The actor ticks once a second; the first idle tick (~1s) pings.
+        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader)).await.unwrap();
+        assert_eq!(ping.header(), terminal_packet_type::KEEP_ALIVE);
+        assert!(ping.payload().is_empty());
+
+        send_peer_packet(&mut peer, &mut pc.writer, terminal_packet_type::KEEP_ALIVE, &[]).await;
+
+        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader)).await.unwrap();
+        assert_eq!(ping.header(), terminal_packet_type::KEEP_ALIVE, "the echo reset the flag");
+
+        // A second full cycle: the reset persists, the socket stays up.
+        send_peer_packet(&mut peer, &mut pc.writer, terminal_packet_type::KEEP_ALIVE, &[]).await;
+        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader)).await.unwrap();
+        assert_eq!(ping.header(), terminal_packet_type::KEEP_ALIVE);
+    }
+
+    /// A missing KEEP_ALIVE echo kills the socket: SocketDown surfaces,
+    /// writes keep buffering (Ok), and the session is not Dead.
+    #[tokio::test]
+    async fn keepalive_without_echo_kills_the_socket() {
+        let mut rig = rig(Some(Duration::from_millis(100))).await;
+        let mut peer = rig.accept().await;
+        let mut pc = peer_crypto();
+
+        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader)).await.unwrap();
+        assert_eq!(ping.header(), terminal_packet_type::KEEP_ALIVE);
+        // Deliberately no echo.
+
+        match timeout(LONG, rig.events.recv()).await {
+            Ok(Some(BackedEvent::SocketDown)) => {}
+            other => panic!("expected SocketDown after the unanswered ping, got {other:?}"),
+        }
+        assert_eq!(rig.backed.write(1, b"buffered".to_vec()).await, Ok(()));
+        assert!(
+            timeout(Duration::from_millis(300), rig.events.recv()).await.is_err(),
+            "keepalive loss disconnects but does not kill the session"
+        );
     }
 }

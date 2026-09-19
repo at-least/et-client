@@ -27,3 +27,13 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "pr
 
 [profile.release]
 lto = "thin"
+
+# The backed-connection tests push >64 MiB through the secretbox stream; the
+# unoptimized crypto crates make that take minutes in a plain dev build.
+# Only the crypto family is optimized; everything else keeps dev settings.
+[profile.dev.package.crypto_secretbox]
+opt-level = 2
+[profile.dev.package.salsa20]
+opt-level = 2
+[profile.dev.package.poly1305]
+opt-level = 2

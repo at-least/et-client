@@ -605,6 +605,8 @@ fn random_u32() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::time::timeout;
 
     fn src(req: &PortForwardSourceRequest) -> (Option<String>, Option<i32>) {
         let s = req.source.as_option().expect("source set");
@@ -673,5 +675,179 @@ mod tests {
             parse_ranges("ENV_VAR:/var/run/example.sock"),
             Err(TunnelParseError::UnsupportedSocket(_))
         ));
+    }
+
+    // ---- engine ----
+
+    fn endpoint(port: u16) -> crate::SocketEndpoint {
+        crate::SocketEndpoint {
+            name: Some("127.0.0.1".into()),
+            port: Some(port as i32),
+            ..Default::default()
+        }
+    }
+
+    fn source_request(port: u16) -> PortForwardSourceRequest {
+        PortForwardSourceRequest {
+            source: endpoint(port).into(),
+            destination: endpoint(1).into(),
+            ..Default::default()
+        }
+    }
+
+    fn destination_request(fd: i32, port: u16) -> Packet {
+        Packet::new(
+            DESTINATION_REQUEST_HEADER,
+            PortForwardDestinationRequest {
+                destination: endpoint(port).into(),
+                fd: Some(fd),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    /// A peer-originated PORT_FORWARD frame, as the engine's owner would
+    /// receive it from the wire and feed back through `EngineHandle::send`.
+    fn pf_frame(socket_id: i32, sourcetodestination: bool, buffer: &[u8], closed: bool) -> Packet {
+        Packet::new(
+            PORT_FORWARD_HEADER,
+            PortForwardData {
+                sourcetodestination: Some(sourcetodestination),
+                socketid: Some(socket_id),
+                buffer: (!closed || !buffer.is_empty()).then(|| buffer.to_vec()),
+                closed: Some(closed),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    async fn next_outbound(rx: &mut mpsc::UnboundedReceiver<Packet>) -> Packet {
+        timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for an engine frame")
+            .expect("the engine task died")
+    }
+
+    /// Echo server on an ephemeral 127.0.0.1 port.
+    async fn spawn_echo() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn spawn_reports_bind_failures() {
+        let taken = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let (_, _, errors) = EngineHandle::spawn(vec![source_request(port)], false).await;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains(&format!("127.0.0.1:{port}")), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn destination_requests_are_refused_when_not_enabled() {
+        let (handle, mut outbound, errors) = EngineHandle::spawn(Vec::new(), false).await;
+        assert!(errors.is_empty());
+        handle.send(destination_request(7, 1));
+        let response = PortForwardDestinationResponse::decode_from_slice(
+            next_outbound(&mut outbound).await.payload(),
+        )
+        .unwrap();
+        assert_eq!(response.clientfd, Some(7));
+        assert!(response.socketid.is_none(), "nothing was opened");
+        let error = response.error.expect("a refusal reason");
+        assert!(error.contains("not enabled"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unreachable_destinations_answer_with_an_error() {
+        // A port that listened and is now closed: connect refuses fast on
+        // both ::1 and 127.0.0.1.
+        let port = {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+        handle.send(destination_request(3, port));
+        let response = PortForwardDestinationResponse::decode_from_slice(
+            next_outbound(&mut outbound).await.payload(),
+        )
+        .unwrap();
+        assert_eq!(response.clientfd, Some(3));
+        assert!(response.socketid.is_none(), "nothing was opened");
+        let error = response.error.expect("a connect failure");
+        assert!(error.contains("could not connect"), "{error}");
+    }
+
+    /// The destination role end to end without a peer: DESTINATION_REQUEST
+    /// opens a loopback connection, DATA{s2d=true} flows into it and comes
+    /// back as DATA{s2d=false}, and a close tears the tunnel down.
+    #[tokio::test]
+    async fn destination_role_moves_data_and_closes() {
+        let echo_port = spawn_echo().await;
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+
+        handle.send(destination_request(1, echo_port));
+        let response = PortForwardDestinationResponse::decode_from_slice(
+            next_outbound(&mut outbound).await.payload(),
+        )
+        .unwrap();
+        assert_eq!(response.clientfd, Some(1));
+        assert!(response.error.is_none());
+        let socket_id = response.socketid.expect("the destination opened");
+
+        handle.send(pf_frame(socket_id, true, b"ping", false));
+        let back =
+            PortForwardData::decode_from_slice(next_outbound(&mut outbound).await.payload())
+                .unwrap();
+        assert_eq!(back.socketid, Some(socket_id));
+        assert_eq!(back.sourcetodestination, Some(false), "the echo flows destination→source");
+        assert_eq!(back.buffer.as_deref(), Some(&b"ping"[..]));
+
+        // The peer's close tears the tunnel down locally — no close frame is
+        // mirrored for a socket we still track (that mirror is only for
+        // unknown sockets) — and data for the dead id is dropped silently.
+        handle.send(pf_frame(socket_id, true, b"", true));
+        handle.send(pf_frame(socket_id, true, b"late", false));
+        assert!(
+            timeout(Duration::from_millis(300), outbound.recv()).await.is_err(),
+            "no frame may follow the tunnel teardown"
+        );
+    }
+
+    /// A close for a socket we no longer track is mirrored back so the peer
+    /// stops pumping, keeping the engine's direction flags.
+    #[tokio::test]
+    async fn closes_for_unknown_sockets_are_mirrored_back() {
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+        for (their_flag, ours) in [(true, true), (false, false)] {
+            handle.send(pf_frame(999, their_flag, b"", true));
+            let mirrored =
+                PortForwardData::decode_from_slice(next_outbound(&mut outbound).await.payload())
+                    .unwrap();
+            assert_eq!(mirrored.socketid, Some(999));
+            assert_eq!(mirrored.sourcetodestination, Some(ours));
+            assert_eq!(mirrored.closed, Some(true));
+        }
     }
 }
