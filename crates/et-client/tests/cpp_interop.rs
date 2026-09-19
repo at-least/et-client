@@ -7,8 +7,10 @@
 //! framing, protobuf bytes, the INITIAL exchange, and the recover exchange
 //! must all agree with the C++ implementation byte-for-byte.
 //!
-//! Skips when the C++ binaries are absent (set `ET_CPP_PREFIX` to the
-//! install prefix; defaults to /opt/homebrew); run with `--ignored`.
+//! Gated behind `#[ignore]`: plain `cargo test` never runs them. Running
+//! them with `--ignored` requires the C++ binaries (brew `et`; set
+//! `ET_CPP_PREFIX` to the install prefix, default /opt/homebrew) and they
+//! panic loudly when the binaries are missing.
 
 use std::process::Stdio;
 use std::time::Duration;

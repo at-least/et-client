@@ -23,7 +23,7 @@ buffa-build = "=0.9.2"
 crypto_secretbox = "=0.1.1"
 thiserror = "2"
 getrandom = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "process", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "process", "macros"] }
 
 [profile.release]
 lto = "thin"

@@ -138,8 +138,9 @@ interop tests, and clippy inside it, validating the Linux build.
 - **Golden wire tests** lock every message encoding and frame layout against
   hand-computed protobuf bytes (the upstream `.proto` files in `proto/` are
   the reference).
-- **Interop tests** (`--ignored`; auto-skip without the binaries, set
-  `ET_CPP_PREFIX` to override `/opt/homebrew`) run against the actual C++
+- **Interop tests** (`--ignored`; they need the C++ binaries and panic
+  loudly without them — set `ET_CPP_PREFIX` to the install prefix, default
+  `/opt/homebrew`) run against the actual C++
   binaries — verified against **brew et 7.0.0** (protocol version 6):
   Rust client ↔ C++ etserver + C++ etterminal, including kill /
   reconnect / catch-up (every line of a mid-stream `seq 1 5000` recovered)
