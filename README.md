@@ -1,4 +1,4 @@
-# et — EternalTerminal client library (Rust, wire-compatible)
+# et-client — EternalTerminal client library (Rust, wire-compatible)
 
 A Rust client library for [EternalTerminal](https://github.com/MisterTea/EternalTerminal)
 (protocol version **6**), built for [conch](../conch): a remote shell whose

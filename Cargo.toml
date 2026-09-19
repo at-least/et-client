@@ -9,7 +9,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/MisterTea/EternalTerminal"
+repository = "https://github.com/newlix/et-client"
 
 # Wire-format dependencies are pinned exact across the workspace (conch-core
 # practice: a byte-for-byte-pinned wire format must not drift with a dep bump).
