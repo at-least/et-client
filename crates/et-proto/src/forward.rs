@@ -18,6 +18,7 @@
 //! ports (upstream clients would).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use buffa::Message as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -230,6 +231,9 @@ pub struct EngineHandle {
     inbound: mpsc::UnboundedSender<Packet>,
     cmd_tx: mpsc::Sender<Cmd>,
     shutdown_tx: watch::Sender<bool>,
+    /// Strong-count of this arc is the number of live handle clones; the
+    /// Drop impl raises the shutdown watch on the transition to zero.
+    handle_count: Arc<()>,
 }
 
 /// Commands into the engine task.
@@ -283,6 +287,7 @@ impl EngineHandle {
                 inbound,
                 cmd_tx,
                 shutdown_tx,
+                handle_count: Arc::new(()),
             },
             outbound_rx,
             bind_errors,
@@ -321,6 +326,16 @@ impl EngineHandle {
             return Vec::new();
         }
         reply_rx.await.unwrap_or_default()
+    }
+}
+
+impl Drop for EngineHandle {
+    fn drop(&mut self) {
+        // Last handle gone: raise the watch so the run loop's blocked
+        // sends abandon even before the command channel's close is seen.
+        if Arc::strong_count(&self.handle_count) == 1 {
+            let _ = self.shutdown_tx.send(true);
+        }
     }
 }
 
@@ -711,9 +726,16 @@ impl EngineState {
                     if closed {
                         conn.teardown();
                     } else if let Some(bytes) = pwd.buffer {
+                        // `wait_for` (not `changed()`): the preempt must
+                        // be idempotent — a second blocked send after the
+                        // first one was abandoned must still see the
+                        // already-raised shutdown.
                         let sent = tokio::select! {
                             r = conn.write_tx.send(bytes) => r.is_ok(),
-                            _ = shutdown.changed() => false,
+                            res = shutdown.wait_for(|v| *v) => {
+                                let _ = res;
+                                false
+                            }
                         };
                         if sent {
                             // keep the connection registered
@@ -748,7 +770,10 @@ async fn send_or_shutdown(
 ) -> bool {
     tokio::select! {
         r = outbound.send(packet) => r.is_ok(),
-        _ = shutdown.changed() => false,
+        res = shutdown.wait_for(|v| *v) => {
+            let _ = res;
+            false
+        }
     }
 }
 
@@ -1333,17 +1358,64 @@ mod tests {
     }
 
     /// Shutdown stays responsive while the engine is blocked feeding a
-    /// stalled local connection: the destination never reads, the write
-    /// queue fills, and the engine sits in the data path — shutdown must
-    /// still complete and close the outbound channel.
+    /// stalled local connection: the destinations never read, the write
+    /// queues fill, and the engine sits in the data path — shutdown must
+    /// still complete and close the outbound channel. TWO congested
+    /// connections, because a shutdown preempt must not be one-shot: the
+    /// first abandoned send must not leave later blocked sends unnoticed.
     #[tokio::test]
-    async fn shutdown_works_while_a_connection_queue_is_congested() {
-        // Accept once, never read: the writer task wedges in write_all.
+    async fn shutdown_works_while_connection_queues_are_congested() {
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+        let mut socket_ids = Vec::new();
+        for i in 0..2 {
+            let service = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let service_port = service.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (_sock, _) = service.accept().await.unwrap();
+                // Hold the socket open without reading, forever.
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+            });
+            handle.send(destination_request(i + 1, service_port));
+            let response = PortForwardDestinationResponse::decode_from_slice(
+                next_outbound(&mut outbound).await.payload(),
+            )
+            .unwrap();
+            socket_ids.push(response.socketid.expect("the destination opened"));
+        }
+
+        // 2048 × 16 KiB = 32 MiB interleaved: past kernel buffers and both
+        // 256-frame queues, so the engine blocks in the data path twice.
+        for _ in 0..1024 {
+            for &socket_id in &socket_ids {
+                handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        timeout(Duration::from_secs(2), handle.shutdown())
+            .await
+            .expect("shutdown must not hang while the engine is congested");
+        let drained = timeout(Duration::from_secs(2), async {
+            while outbound.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "the outbound channel must close after shutdown during congestion"
+        );
+    }
+
+    /// Dropping the last handle also stops a congested engine: the drop
+    /// itself must raise the shutdown watch, or a blocked data-path send
+    /// wedges the engine exactly as before shutdown preemption existed.
+    #[tokio::test]
+    async fn dropping_the_last_handle_stops_a_congested_engine() {
         let service = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let service_port = service.local_addr().unwrap().port();
         tokio::spawn(async move {
             let (_sock, _) = service.accept().await.unwrap();
-            // Hold the socket open without reading, forever.
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
@@ -1357,23 +1429,19 @@ mod tests {
         .unwrap();
         let socket_id = response.socketid.expect("the destination opened");
 
-        // 1024 × 16 KiB = 16 MiB: past kernel buffers and the 256-frame
-        // queue, so the engine is blocked inside the data path.
         for _ in 0..1024 {
             handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        timeout(Duration::from_secs(2), handle.shutdown())
-            .await
-            .expect("shutdown must not hang while the engine is congested");
+        drop(handle);
         let drained = timeout(Duration::from_secs(2), async {
             while outbound.recv().await.is_some() {}
         })
         .await;
         assert!(
             drained.is_ok(),
-            "the outbound channel must close after shutdown during congestion"
+            "the engine must stop on last-handle drop even while congested"
         );
     }
 }

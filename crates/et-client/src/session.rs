@@ -262,7 +262,6 @@ impl TerminalSession {
     pub async fn next_event(&mut self) -> Option<SessionEvent> {
         loop {
             tokio::select! {
-                biased;
                 frame = async {
                     match &mut self.pf_outbound {
                         Some(rx) => rx.recv().await,
