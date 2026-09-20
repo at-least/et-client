@@ -235,6 +235,10 @@ const OUTBOUND_QUEUE_DEPTH: usize = 256;
 /// Backoff after a failed `accept()` (transient per-connection or resource
 /// errors; the loop retries instead of killing the source listener).
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Cap on peer-initiated destination connections: each holds a loopback
+/// `TcpStream` plus two tasks, and the peer decides how many to open —
+/// every other engine resource is bounded, so this one is too.
+const MAX_DESTINATION_CONNECTIONS: usize = 256;
 
 /// A running engine. Feed it the peer's port-forward packets; it emits the
 /// frames to write back to the session. The engine stops — listeners
@@ -989,6 +993,19 @@ async fn create_destination(
             ..Default::default()
         };
     };
+    // The peer decides how many connections to open and each one holds an
+    // fd plus two tasks — refuse beyond the cap rather than accumulating
+    // them (a malicious etserver must not exhaust fds this way).
+    if destinations.len() >= MAX_DESTINATION_CONNECTIONS {
+        return PortForwardDestinationResponse {
+            clientfd: request.fd,
+            error: Some(format!(
+                "too many open destination connections ({}); refusing",
+                destinations.len()
+            )),
+            ..Default::default()
+        };
+    }
     let stream = match TcpStream::connect(("::1", port)).await {
         Ok(s) => Some(s),
         Err(_) => TcpStream::connect(("127.0.0.1", port)).await.ok(),
@@ -1649,6 +1666,36 @@ mod tests {
                 .is_err(),
             "no frame may follow the tunnel teardown"
         );
+    }
+
+    /// Peer-initiated destination connections are capped: a peer replaying
+    /// `DESTINATION_REQUEST`s (each one opens a loopback connection that
+    /// holds an fd and two tasks) must not hold resources without limit.
+    /// Requests beyond the cap get an error response — the same wire shape
+    /// as a refused or unreachable destination — not a silent drop.
+    #[tokio::test]
+    async fn peer_destination_connections_are_capped() {
+        let echo_port = spawn_echo().await;
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+        for i in 0..MAX_DESTINATION_CONNECTIONS {
+            handle.send(destination_request(i as i32 + 1, echo_port));
+            let response = PortForwardDestinationResponse::decode_from_slice(
+                next_outbound(&mut outbound).await.payload(),
+            )
+            .unwrap();
+            assert_eq!(response.clientfd, Some(i as i32 + 1));
+            assert!(response.socketid.is_some(), "within the cap, got {response:?}");
+        }
+
+        handle.send(destination_request(9999, echo_port));
+        let response = PortForwardDestinationResponse::decode_from_slice(
+            next_outbound(&mut outbound).await.payload(),
+        )
+        .unwrap();
+        assert_eq!(response.clientfd, Some(9999));
+        assert!(response.socketid.is_none(), "beyond the cap, got {response:?}");
+        let error = response.error.expect("a cap refusal reason");
+        assert!(error.contains("too many"), "{error}");
     }
 
     /// Frames for a socket we do not track are dropped silently — the
