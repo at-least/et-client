@@ -231,6 +231,11 @@ impl EtClient {
                                 let _ = events_tx
                                     .send(Event::Dead(ClientDeadReason::ServerStateLost))
                                     .await;
+                                // Terminal like InvalidKey: without this,
+                                // post-death writes keep buffering toward a
+                                // session that can never resume, returning
+                                // Ok and discarding the data.
+                                let _ = sup_backed.shutdown().await;
                                 return;
                             }
                             Err(ConnectFailure::Rejected {
@@ -517,6 +522,11 @@ mod tests {
             Some(Event::Dead(ClientDeadReason::ServerStateLost)) => {}
             other => panic!("expected Dead(ServerStateLost), got {other:?}"),
         }
+        assert_eq!(
+            client.write(1, b"x".to_vec()).await,
+            Err(WriteError::Shutdown),
+            "the supervisor must shut the backed layer down, like the InvalidKey path"
+        );
         assert!(
             client.next_event().await.is_none(),
             "the channel closes afterwards"
