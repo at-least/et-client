@@ -297,9 +297,7 @@ mod tests {
         MAX_HANDSHAKE_PROTO_LENGTH, MAX_PACKET_LENGTH, PortForwardDestinationRequest,
         PROTOCOL_VERSION, SERVER_CLIENT_NONCE_MSB, SocketEndpoint,
     };
-    use std::net::SocketAddr;
     use std::sync::Arc;
-    use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
     use tokio::time::{timeout, timeout_at};
 
@@ -321,10 +319,7 @@ mod tests {
     }
 
     struct Rig {
-        listener: Arc<TcpListener>,
-        addr: SocketAddr,
         peer: tokio::net::TcpStream,
-        to_client: CryptoHandler,
         from_client: CryptoHandler,
     }
 
@@ -373,7 +368,7 @@ mod tests {
         let mut to_client = CryptoHandler::new(&key, SERVER_CLIENT_NONCE_MSB);
         let mut from_client = CryptoHandler::new(&key, CLIENT_SERVER_NONCE_MSB);
 
-        let initial = timeout(LONG, async {
+        timeout(LONG, async {
             let mut packet = read_framed_packet(&mut peer, MAX_PACKET_LENGTH).await.unwrap();
             assert!(packet.is_encrypted());
             packet.decrypt(&mut from_client).unwrap();
@@ -385,10 +380,9 @@ mod tests {
         })
         .await
         .expect("the INITIAL exchange must complete");
-        let _ = initial;
 
         let session = timeout(LONG, session_rx).await.unwrap().unwrap().unwrap();
-        (session, Rig { listener, addr, peer, to_client, from_client })
+        (session, Rig { peer, from_client })
     }
 
     fn source_request(port: u16) -> PortForwardSourceRequest {
