@@ -367,27 +367,39 @@ impl BackedActor {
         }
     }
 
+    /// Fail closed on unparseable, unauthenticated, or undecryptable input:
+    /// the session dies once with `CryptoMismatch` (upstream STFATALs) and
+    /// the run loop's final send must not append a second Dead.
+    async fn die_crypto_mismatch(&mut self) {
+        self.shutting_down = true;
+        self.dead_sent = true;
+        let _ = self
+            .events_tx
+            .send(BackedEvent::Dead(DeadReason::CryptoMismatch))
+            .await;
+    }
+
     async fn deliver_inbox(&mut self) {
         while let Some(bytes) = self.inbox.pop_front() {
             // A frame that fails to parse is protocol corruption: skipping
             // it without advancing the reader sequence would desynchronize
             // every later recover (the peer would resend the wrong span).
             let Some(mut packet) = Packet::parse(&bytes) else {
-                self.shutting_down = true;
-                self.dead_sent = true;
-                let _ = self
-                    .events_tx
-                    .send(BackedEvent::Dead(DeadReason::CryptoMismatch))
-                    .await;
+                self.die_crypto_mismatch().await;
                 return;
             };
-            if packet.is_encrypted() && packet.decrypt(&mut self.reader_crypto).is_err() {
-                self.shutting_down = true;
-                self.dead_sent = true;
-                let _ = self
-                    .events_tx
-                    .send(BackedEvent::Dead(DeadReason::CryptoMismatch))
-                    .await;
+            // The flag byte is attacker-writable, so a packet that claims
+            // to be plaintext was never MAC-verified by anyone — and the
+            // secretbox stream is the only authenticity guarantee on this
+            // leg. Upstream's reader decrypts unconditionally and STFATALs
+            // on exactly this case; fail closed the same way instead of
+            // delivering unauthenticated bytes.
+            if !packet.is_encrypted() {
+                self.die_crypto_mismatch().await;
+                return;
+            }
+            if packet.decrypt(&mut self.reader_crypto).is_err() {
+                self.die_crypto_mismatch().await;
                 return;
             }
             // Inbound traffic resets the keepalive deadline; a KEEP_ALIVE
@@ -1142,6 +1154,40 @@ mod tests {
             // closes without a second, reason-less Dead.
             assert!(rig.events.recv().await.is_none());
         }
+    }
+
+    /// A packet whose own wire flag says "not encrypted" was never
+    /// MAC-verified by anyone, and the flag byte is attacker-writable: the
+    /// secretbox stream is the only authenticity guarantee on this leg
+    /// (etserver relays ciphertext), so delivering it would let anyone
+    /// inject unauthenticated terminal output or port-forward steering.
+    /// Upstream's reader decrypts unconditionally and STFATALs on exactly
+    /// this case — the session dies with `CryptoMismatch` here too.
+    #[tokio::test]
+    async fn plaintext_flagged_packet_kills_session_with_crypto_mismatch() {
+        let mut rig = rig(None).await;
+        let mut peer = rig.accept().await;
+        // [encrypted=0][TERMINAL_BUFFER] + payload: no MAC, no key needed.
+        let frame = [
+            0u8,
+            terminal_packet_type::TERMINAL_BUFFER,
+            b'p',
+            b'w',
+            b'n',
+        ];
+        let len = frame.len() as u32;
+        peer.write_all(&len.to_be_bytes()).await.unwrap();
+        peer.write_all(&frame).await.unwrap();
+
+        match timeout(LONG, rig.events.recv()).await {
+            Ok(Some(BackedEvent::Dead(DeadReason::CryptoMismatch))) => {}
+            other => panic!("expected Dead(CryptoMismatch), got {other:?}"),
+        }
+        assert_eq!(
+            rig.backed.write(1, b"x".to_vec()).await,
+            Err(WriteError::Shutdown)
+        );
+        assert!(rig.events.recv().await.is_none());
     }
 
     /// Dropping every handle is a shutdown: the actor drains, reports
