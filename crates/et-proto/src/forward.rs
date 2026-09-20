@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use buffa::Message as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -209,6 +210,13 @@ fn parse_ssh_tunnel_arg(input: &str) -> Result<Vec<String>, TunnelParseError> {
 // Engine
 // ---------------------------------------------------------------------------
 
+/// How long [`EngineHandle::add_sources`] may wait for the engine to get
+/// to the command: the engine processes it between data-path work, and a
+/// congested tunnel can hold it. Bounded so an embedder's
+/// `start_port_forwarding` cannot hang forever; shutdown ends the wait
+/// immediately.
+const ADD_SOURCES_BOUND: Duration = Duration::from_secs(30);
+
 /// Per-connection local write queue depth. Bounded so a stalled local
 /// reader applies backpressure through the engine instead of growing
 /// memory without limit; a send failure means the writer task is gone
@@ -316,6 +324,16 @@ impl EngineHandle {
     /// the engine is busy draining a congested tunnel; [`shutdown`]
     /// (EngineHandle::shutdown) preempts that wait on the engine's side.
     pub async fn add_sources(&self, sources: Vec<PortForwardSourceRequest>) -> Vec<String> {
+        self.add_sources_timed(sources, ADD_SOURCES_BOUND).await
+    }
+
+    /// Timing-injectable [`EngineHandle::add_sources`] (tests drive small
+    /// bounds).
+    pub(crate) async fn add_sources_timed(
+        &self,
+        sources: Vec<PortForwardSourceRequest>,
+        bound: Duration,
+    ) -> Vec<String> {
         let (reply, reply_rx) = oneshot::channel();
         if self
             .cmd_tx
@@ -323,9 +341,23 @@ impl EngineHandle {
             .await
             .is_err()
         {
-            return Vec::new();
+            return vec!["port-forward engine is not running".into()];
         }
-        reply_rx.await.unwrap_or_default()
+        let mut shutdown = self.shutdown_tx.subscribe();
+        tokio::select! {
+            replied = reply_rx => replied.unwrap_or_else(|_| {
+                vec!["port-forward engine stopped before binding the new sources".into()]
+            }),
+            res = shutdown.wait_for(|v| *v) => {
+                let _ = res;
+                vec!["port-forward engine is shutting down".into()]
+            }
+            _ = tokio::time::sleep(bound) => {
+                vec![format!(
+                    "port-forward engine did not bind the new sources within {bound:?}                      (a congested tunnel is blocking it)"
+                )]
+            }
+        }
     }
 }
 
@@ -799,6 +831,10 @@ async fn run(mut state: EngineState, answer_destinations: bool, chans: EngineCha
 
     loop {
         tokio::select! {
+            // Commands first: add_sources and shutdown stay prompt while
+            // the loop is merely busy (a blocked data-path send is handled
+            // by the shutdown preemption inside the handlers).
+            biased;
             cmd = cmd_rx.recv() => match cmd {
                 Some(Cmd::AddSources { sources: new_sources, reply }) => {
                     let base = state.sources.len();
@@ -1243,6 +1279,94 @@ mod tests {
         let taken_port = taken.local_addr().unwrap().port();
         let errors = handle.add_sources(vec![source_request(taken_port)]).await;
         assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    /// A never-reading destination wedges the engine in the data path;
+    /// `add_sources` must still return — bounded — instead of hanging the
+    /// caller (the embedder's `start_port_forwarding`) forever.
+    #[tokio::test]
+    async fn add_sources_is_bounded_while_the_engine_is_congested() {
+        let service = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let service_port = service.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_sock, _) = service.accept().await.unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+        handle.send(destination_request(1, service_port));
+        let response = PortForwardDestinationResponse::decode_from_slice(
+            next_outbound(&mut outbound).await.payload(),
+        )
+        .unwrap();
+        let socket_id = response.socketid.expect("the destination opened");
+        for _ in 0..1024 {
+            handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let port = {
+            let probe = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let errors = timeout(
+            Duration::from_secs(2),
+            handle.add_sources_timed(vec![source_request(port)], Duration::from_millis(300)),
+        )
+        .await
+        .expect("add_sources must return within its bound even while congested");
+        assert!(
+            errors.iter().any(|e| e.as_str().contains("did not bind")),
+            "the bounded wait must report itself, got {errors:?}"
+        );
+    }
+
+    /// `add_sources` waiting behind congestion reports shutdown instead of
+    /// hanging until its bound when the engine stops.
+    #[tokio::test]
+    async fn add_sources_waiting_in_congestion_reports_shutdown() {
+        let service = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let service_port = service.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_sock, _) = service.accept().await.unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+        handle.send(destination_request(1, service_port));
+        let response = PortForwardDestinationResponse::decode_from_slice(
+            next_outbound(&mut outbound).await.payload(),
+        )
+        .unwrap();
+        let socket_id = response.socketid.expect("the destination opened");
+        for _ in 0..1024 {
+            handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let waiting = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .add_sources_timed(vec![], Duration::from_secs(30))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.shutdown().await;
+
+        let errors = timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("shutdown must end the add_sources wait promptly")
+            .expect("the add_sources task must not panic");
+        assert!(
+            errors.iter().any(|e| e.as_str().contains("shutting down")),
+            "shutdown during the wait must be reported, got {errors:?}"
+        );
     }
 
     #[tokio::test]
