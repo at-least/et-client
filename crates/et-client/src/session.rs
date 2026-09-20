@@ -82,7 +82,7 @@ pub struct TerminalSession {
     /// Port-forward engine once [`TerminalSession::start_port_forwarding`]
     /// ran: peer PF frames route in, engine frames write out.
     pf_inbound: Option<EngineHandle>,
-    pf_outbound: Option<mpsc::UnboundedReceiver<Packet>>,
+    pf_outbound: Option<mpsc::Receiver<Packet>>,
 }
 
 impl TerminalSession {

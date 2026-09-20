@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use buffa::Message as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     Packet, PortForwardData, PortForwardDestinationRequest, PortForwardDestinationResponse,
@@ -196,17 +196,36 @@ fn parse_ssh_tunnel_arg(input: &str) -> Result<Vec<String>, TunnelParseError> {
 // Engine
 // ---------------------------------------------------------------------------
 
+/// Per-connection local write queue depth. Bounded so a stalled local
+/// reader applies backpressure through the engine instead of growing
+/// memory without limit; a send failure means the writer task is gone
+/// (connection dead) and the tunnel is torn down.
+const CONN_WRITE_QUEUE_DEPTH: usize = 256;
+/// Local I/O event queue depth: read tasks block here when the engine is
+/// saturated, which backs up the local TCP connections.
+const EVENT_QUEUE_DEPTH: usize = 1024;
+/// Outbound (engine → session) queue depth: the engine blocks here when
+/// the session pump is not draining, the last backpressure stage before
+/// the backed layer's own 64 MiB caps.
+const OUTBOUND_QUEUE_DEPTH: usize = 256;
+
 /// A running engine. Feed it the peer's port-forward packets; it emits the
-/// frames to write back to the session.
+/// frames to write back to the session. The engine stops — listeners
+/// released, connections torn down, outbound closed — on [`shutdown`]
+/// (EngineHandle::shutdown) or when every handle clone is dropped.
 #[derive(Clone)]
 pub struct EngineHandle {
     inbound: mpsc::UnboundedSender<Packet>,
+    cmd_tx: mpsc::Sender<Cmd>,
 }
 
-impl EngineHandle {
-    pub fn send(&self, packet: Packet) {
-        let _ = self.inbound.send(packet);
-    }
+/// Commands into the engine task.
+enum Cmd {
+    /// Bind more sources into the running engine; reply carries the bind
+    /// errors (one per failed bind, like [`EngineHandle::spawn`]).
+    AddSources { sources: Vec<PortForwardSourceRequest>, reply: oneshot::Sender<Vec<String>> },
+    /// Stop the engine.
+    Shutdown,
 }
 
 impl EngineHandle {
@@ -220,26 +239,107 @@ impl EngineHandle {
     pub async fn spawn(
         sources: Vec<PortForwardSourceRequest>,
         answer_destinations: bool,
-    ) -> (EngineHandle, mpsc::UnboundedReceiver<Packet>, Vec<String>) {
+    ) -> (EngineHandle, mpsc::Receiver<Packet>, Vec<String>) {
         let (inbound, inbound_rx) = mpsc::unbounded_channel();
-        let (outbound, outbound_rx) = mpsc::unbounded_channel();
-        let mut bind_errors = Vec::new();
-        let mut bound: Vec<(usize, TcpListener)> = Vec::new();
-        for (source_idx, pfsr) in sources.iter().enumerate() {
-            let source = &pfsr.source;
-            if !source.is_set() {
-                continue;
-            }
-            let Some(port) = source.port else { continue };
-            let host = source.name.clone().unwrap_or_else(|| "localhost".into());
-            match TcpListener::bind((host.as_str(), port as u16)).await {
-                Ok(listener) => bound.push((source_idx, listener)),
-                Err(e) => bind_errors.push(format!("{host}:{port}: {e}")),
+        let (outbound, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_DEPTH);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (events_tx, events) = mpsc::channel(EVENT_QUEUE_DEPTH);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (listeners, bind_errors) = bind_source_listeners(&sources, 0).await;
+        for (source_idx, listener) in listeners {
+            spawn_accept_task(listener, source_idx, events_tx.clone(), shutdown_rx.clone());
+        }
+        let state = EngineState::new(sources, events_tx.clone());
+        tokio::spawn(run(
+            state,
+            answer_destinations,
+            EngineChannels { inbound: inbound_rx, cmd_rx, outbound, events, shutdown_tx, shutdown_rx },
+        ));
+        (EngineHandle { inbound, cmd_tx }, outbound_rx, bind_errors)
+    }
+
+    pub fn send(&self, packet: Packet) {
+        let _ = self.inbound.send(packet);
+    }
+
+    /// Stops the engine: source listeners are released, every tunneled
+    /// connection is torn down, and the outbound channel closes. Idempotent;
+    /// also happens implicitly when every handle clone is dropped.
+    pub async fn shutdown(&self) {
+        let _ = self.cmd_tx.send(Cmd::Shutdown).await;
+    }
+
+    /// Binds additional sources into the already-running engine (the
+    /// session layer uses this to add local forward sources to a session
+    /// that pre-spawned a destinations-only engine for reverse tunnels).
+    /// Returns one message per failed bind, like [`EngineHandle::spawn`].
+    pub async fn add_sources(&self, sources: Vec<PortForwardSourceRequest>) -> Vec<String> {
+        let (reply, reply_rx) = oneshot::channel();
+        if self.cmd_tx.send(Cmd::AddSources { sources, reply }).await.is_err() {
+            return Vec::new();
+        }
+        reply_rx.await.unwrap_or_default()
+    }
+}
+
+/// Binds `sources` (whose indices start at `base_idx` in the engine's
+/// source table) and returns the live listeners plus one error message
+/// per failed bind.
+async fn bind_source_listeners(
+    sources: &[PortForwardSourceRequest],
+    base_idx: usize,
+) -> (Vec<(usize, TcpListener)>, Vec<String>) {
+    let mut bound = Vec::new();
+    let mut bind_errors = Vec::new();
+    for (i, pfsr) in sources.iter().enumerate() {
+        let source = &pfsr.source;
+        if !source.is_set() {
+            continue;
+        }
+        let Some(port) = source.port else { continue };
+        let host = source.name.clone().unwrap_or_else(|| "localhost".into());
+        match TcpListener::bind((host.as_str(), port as u16)).await {
+            Ok(listener) => bound.push((base_idx + i, listener)),
+            Err(e) => bind_errors.push(format!("{host}:{port}: {e}")),
+        }
+    }
+    (bound, bind_errors)
+}
+
+/// One source listener: accepts until the engine shuts down or the event
+/// channel dies. Blocking on a full event channel is the backpressure
+/// path (the accept backlog absorbs the excess).
+fn spawn_accept_task(
+    listener: TcpListener,
+    source_idx: usize,
+    events: mpsc::Sender<Event>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                }
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, _)) => {
+                            if events
+                                .send(Event::Accepted { source_idx, stream })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
             }
         }
-        tokio::spawn(run(sources, bound, answer_destinations, inbound_rx, outbound));
-        (EngineHandle { inbound }, outbound_rx, bind_errors)
-    }
+    });
 }
 
 #[derive(Debug)]
@@ -249,17 +349,16 @@ enum Event {
     /// Bytes (or EOF/error) read from a local connection. Destination-role
     /// connections use their random socket id as `conn_id`.
     Read { conn_id: u32, result: std::io::Result<Vec<u8>> },
-    Packet(Packet),
 }
 
 /// A local TCP connection: one task writing peer data, one reading.
 struct Conn {
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    write_tx: mpsc::Sender<Vec<u8>>,
     read_abort: tokio::task::AbortHandle,
 }
 
-fn spawn_conn(conn_id: u32, stream: TcpStream, events: mpsc::UnboundedSender<Event>) -> Conn {
-    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+fn spawn_conn(conn_id: u32, stream: TcpStream, events: mpsc::Sender<Event>) -> Conn {
+    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(CONN_WRITE_QUEUE_DEPTH);
     // tokio TcpStream is not clonable: round-trip through std to duplicate,
     // then re-wrap (both halves stay in the non-blocking mode tokio set).
     let dup = || -> std::io::Result<(TcpStream, TcpStream)> {
@@ -276,19 +375,20 @@ fn spawn_conn(conn_id: u32, stream: TcpStream, events: mpsc::UnboundedSender<Eve
         loop {
             match read_stream.read(&mut buf).await {
                 Ok(0) => {
-                    let _ = events.send(Event::Read { conn_id, result: Ok(Vec::new()) });
+                    let _ = events.send(Event::Read { conn_id, result: Ok(Vec::new()) }).await;
                     return;
                 }
                 Ok(n) => {
                     if events
                         .send(Event::Read { conn_id, result: Ok(buf[..n].to_vec()) })
+                        .await
                         .is_err()
                     {
                         return;
                     }
                 }
                 Err(e) => {
-                    let _ = events.send(Event::Read { conn_id, result: Err(e) });
+                    let _ = events.send(Event::Read { conn_id, result: Err(e) }).await;
                     return;
                 }
             }
@@ -319,207 +419,280 @@ impl Conn {
     }
 }
 
-async fn run(
+/// The engine's mutable state, shared by the select arms of [`run`].
+struct EngineState {
     sources: Vec<PortForwardSourceRequest>,
-    bound: Vec<(usize, TcpListener)>,
-    answer_destinations: bool,
-    mut inbound: mpsc::UnboundedReceiver<Packet>,
-    outbound: mpsc::UnboundedSender<Packet>,
-) {
-    let (events_tx, mut events) = mpsc::unbounded_channel::<Event>();
-    // Peer packets merge into the same event stream as local I/O.
-    {
-        let events_tx = events_tx.clone();
-        tokio::spawn(async move {
-            while let Some(packet) = inbound.recv().await {
-                if events_tx.send(Event::Packet(packet)).is_err() {
-                    return;
-                }
-            }
-        });
+    events_tx: mpsc::Sender<Event>,
+    next_conn_id: u32,
+    /// Accepted, REQUEST sent, awaiting RESPONSE (source role).
+    pending: HashMap<u32, TcpStream>,
+    /// socketid → connection, source role (mapped on RESPONSE).
+    source_sockets: HashMap<u32, Conn>,
+    /// conn_id → socketid, source role.
+    source_conn_ids: HashMap<u32, u32>,
+    /// socketid → connection, destination role (conn_id == socketid).
+    destinations: HashMap<u32, Conn>,
+}
+
+impl EngineState {
+    fn new(sources: Vec<PortForwardSourceRequest>, events_tx: mpsc::Sender<Event>) -> Self {
+        Self {
+            sources,
+            events_tx,
+            next_conn_id: 1,
+            pending: HashMap::new(),
+            source_sockets: HashMap::new(),
+            source_conn_ids: HashMap::new(),
+            destinations: HashMap::new(),
+        }
     }
 
-    // Source listeners (forward role). Accept tasks attribute connections
-    // with the listener's index into `sources`.
-    for (source_idx, listener) in bound {
-        let tx = events_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        if tx.send(Event::Accepted { source_idx, stream }).is_err() {
-                            return;
-                        }
+    /// Terminate every tracked connection; called when the engine stops.
+    fn teardown_all(self) {
+        for (_, conn) in self.source_sockets {
+            conn.teardown();
+        }
+        for (_, conn) in self.destinations {
+            conn.teardown();
+        }
+        // `pending` holds bare streams: dropping closes them.
+    }
+
+    async fn handle_accepted(&mut self, source_idx: usize, stream: TcpStream, outbound: &mpsc::Sender<Packet>) {
+        let Some(destination) =
+            self.sources.get(source_idx).and_then(|pfsr| pfsr.destination.as_option().cloned())
+        else {
+            return;
+        };
+        let conn_id = self.next_conn_id;
+        self.next_conn_id += 1;
+        self.pending.insert(conn_id, stream);
+        let request = PortForwardDestinationRequest {
+            destination: destination.into(),
+            fd: Some(conn_id as i32),
+            ..Default::default()
+        };
+        let _ = outbound
+            .send(Packet::new(DESTINATION_REQUEST_HEADER, request.encode_to_vec()))
+            .await;
+    }
+
+    async fn handle_read(&mut self, conn_id: u32, result: std::io::Result<Vec<u8>>, outbound: &mpsc::Sender<Packet>) {
+        if let Some(&socket_id) = self.source_conn_ids.get(&conn_id) {
+            // Source role: local reads → peer destination.
+            match result {
+                Ok(bytes) if !bytes.is_empty() => {
+                    let _ = outbound.send(data_packet(socket_id, true, bytes)).await;
+                }
+                Ok(_) => {
+                    let _ = outbound.send(closed_packet(socket_id, true)).await;
+                    if let Some(conn) = self.source_sockets.remove(&socket_id) {
+                        conn.teardown();
                     }
-                    Err(_) => return,
+                    self.source_conn_ids.remove(&conn_id);
+                }
+                Err(e) => {
+                    let _ = outbound.send(error_packet(socket_id, true, &e)).await;
+                    let _ = outbound.send(closed_packet(socket_id, true)).await;
+                    if let Some(conn) = self.source_sockets.remove(&socket_id) {
+                        conn.teardown();
+                    }
+                    self.source_conn_ids.remove(&conn_id);
                 }
             }
-        });
+        } else if self.destinations.contains_key(&conn_id) {
+            // Destination role: local reads → peer source.
+            let socket_id = conn_id;
+            match result {
+                Ok(bytes) if !bytes.is_empty() => {
+                    let _ = outbound.send(data_packet(socket_id, false, bytes)).await;
+                }
+                Ok(_) => {
+                    let _ = outbound.send(closed_packet(socket_id, false)).await;
+                    if let Some(conn) = self.destinations.remove(&socket_id) {
+                        conn.teardown();
+                    }
+                }
+                Err(e) => {
+                    let _ = outbound.send(error_packet(socket_id, false, &e)).await;
+                    let _ = outbound.send(closed_packet(socket_id, false)).await;
+                    if let Some(conn) = self.destinations.remove(&socket_id) {
+                        conn.teardown();
+                    }
+                }
+            }
+        }
+        // else: connection already torn down; trailing read events.
     }
 
-    let mut next_conn_id: u32 = 1;
-    // Accepted, REQUEST sent, awaiting RESPONSE (source role).
-    let mut pending: HashMap<u32, TcpStream> = HashMap::new();
-    // socketid → connection, source role (mapped on RESPONSE).
-    let mut source_sockets: HashMap<u32, Conn> = HashMap::new();
-    // conn_id → socketid, source role.
-    let mut source_conn_ids: HashMap<u32, u32> = HashMap::new();
-    // socketid → connection, destination role (conn_id == socketid).
-    let mut destinations: HashMap<u32, Conn> = HashMap::new();
-
-    while let Some(event) = events.recv().await {
-        match event {
-            Event::Accepted { source_idx, stream } => {
-                let Some(destination) =
-                    sources.get(source_idx).and_then(|pfsr| pfsr.destination.as_option().cloned())
+    async fn handle_peer_packet(
+        &mut self,
+        packet: Packet,
+        answer_destinations: bool,
+        outbound: &mpsc::Sender<Packet>,
+    ) {
+        match packet.header() {
+            DESTINATION_REQUEST_HEADER => {
+                let Ok(request) =
+                    PortForwardDestinationRequest::decode_from_slice(packet.payload())
                 else {
-                    continue;
+                    return;
                 };
-                let conn_id = next_conn_id;
-                next_conn_id += 1;
-                pending.insert(conn_id, stream);
-                let request = PortForwardDestinationRequest {
-                    destination: destination.into(),
-                    fd: Some(conn_id as i32),
-                    ..Default::default()
+                let response = if !answer_destinations {
+                    PortForwardDestinationResponse {
+                        clientfd: request.fd,
+                        error: Some(
+                            "port forwarding destinations are not enabled on this session"
+                                .into(),
+                        ),
+                        ..Default::default()
+                    }
+                } else {
+                    create_destination(&request, &mut self.destinations, &self.events_tx).await
                 };
-                let _ = outbound.send(Packet::new(
-                    DESTINATION_REQUEST_HEADER,
-                    request.encode_to_vec(),
-                ));
+                let _ = outbound
+                    .send(Packet::new(DESTINATION_RESPONSE_HEADER, response.encode_to_vec()))
+                    .await;
             }
-            Event::Read { conn_id, result } => {
-                if let Some(&socket_id) = source_conn_ids.get(&conn_id) {
-                    // Source role: local reads → peer destination.
-                    match result {
-                        Ok(bytes) if !bytes.is_empty() => {
-                            let _ = outbound.send(data_packet(socket_id, true, bytes));
-                        }
-                        Ok(_) => {
-                            let _ = outbound.send(closed_packet(socket_id, true));
-                            if let Some(conn) = source_sockets.remove(&socket_id) {
-                                conn.teardown();
-                            }
-                            source_conn_ids.remove(&conn_id);
-                        }
-                        Err(e) => {
-                            let _ = outbound.send(error_packet(socket_id, true, &e));
-                            let _ = outbound.send(closed_packet(socket_id, true));
-                            if let Some(conn) = source_sockets.remove(&socket_id) {
-                                conn.teardown();
-                            }
-                            source_conn_ids.remove(&conn_id);
-                        }
+            DESTINATION_RESPONSE_HEADER => {
+                let Ok(response) =
+                    PortForwardDestinationResponse::decode_from_slice(packet.payload())
+                else {
+                    return;
+                };
+                let Some(conn_id) = response.clientfd.map(|v| v as u32) else { return };
+                let Some(stream) = self.pending.remove(&conn_id) else { return };
+                match response.socketid {
+                    Some(socketid) => {
+                        let socket_id = socketid as u32;
+                        let conn = spawn_conn(conn_id, stream, self.events_tx.clone());
+                        self.source_sockets.insert(socket_id, conn);
+                        self.source_conn_ids.insert(conn_id, socket_id);
                     }
-                } else if destinations.contains_key(&conn_id) {
-                    // Destination role: local reads → peer source.
-                    let socket_id = conn_id;
-                    match result {
-                        Ok(bytes) if !bytes.is_empty() => {
-                            let _ = outbound.send(data_packet(socket_id, false, bytes));
-                        }
-                        Ok(_) => {
-                            let _ = outbound.send(closed_packet(socket_id, false));
-                            if let Some(conn) = destinations.remove(&socket_id) {
-                                conn.teardown();
-                            }
-                        }
-                        Err(e) => {
-                            let _ = outbound.send(error_packet(socket_id, false, &e));
-                            let _ = outbound.send(closed_packet(socket_id, false));
-                            if let Some(conn) = destinations.remove(&socket_id) {
-                                conn.teardown();
-                            }
-                        }
+                    None => {
+                        // Peer refused (or its destination failed): the
+                        // local stream drops, resetting the acceptor.
+                        drop(stream);
                     }
                 }
-                // else: connection already torn down; trailing read events.
             }
-            Event::Packet(packet) => match packet.header() {
-                DESTINATION_REQUEST_HEADER => {
-                    let Ok(request) =
-                        PortForwardDestinationRequest::decode_from_slice(packet.payload())
-                    else {
-                        continue;
-                    };
-                    let response = if !answer_destinations {
-                        PortForwardDestinationResponse {
-                            clientfd: request.fd,
-                            error: Some(
-                                "port forwarding destinations are not enabled on this session"
-                                    .into(),
-                            ),
-                            ..Default::default()
-                        }
-                    } else {
-                        create_destination(&request, &mut destinations, &events_tx).await
-                    };
-                    let _ = outbound.send(Packet::new(
-                        DESTINATION_RESPONSE_HEADER,
-                        response.encode_to_vec(),
-                    ));
-                }
-                DESTINATION_RESPONSE_HEADER => {
-                    let Ok(response) =
-                        PortForwardDestinationResponse::decode_from_slice(packet.payload())
-                    else {
-                        continue;
-                    };
-                    let Some(conn_id) = response.clientfd.map(|v| v as u32) else { continue };
-                    let Some(stream) = pending.remove(&conn_id) else { continue };
-                    match response.socketid {
-                        Some(socketid) => {
-                            let socket_id = socketid as u32;
-                            let conn = spawn_conn(conn_id, stream, events_tx.clone());
-                            source_sockets.insert(socket_id, conn);
-                            source_conn_ids.insert(conn_id, socket_id);
-                        }
-                        None => {
-                            // Peer refused (or its destination failed): the
-                            // local stream drops, resetting the acceptor.
-                            drop(stream);
-                        }
-                    }
-                }
-                PORT_FORWARD_HEADER => {
-                    let Ok(pwd) = PortForwardData::decode_from_slice(packet.payload()) else {
-                        continue;
-                    };
-                    let Some(socket_id) = pwd.socketid.map(|v| v as u32) else { continue };
-                    let closed = pwd.closed.unwrap_or(false) || pwd.error.is_some();
-                    let sourcetodestination = pwd.sourcetodestination.unwrap_or(false);
-                    let (table, mirror_flag) = if sourcetodestination {
-                        // Peer's source data → our destination connection.
-                        (&mut destinations, true)
-                    } else {
-                        // Peer's destination data → our source connection.
-                        (&mut source_sockets, false)
-                    };
-                    match table.remove(&socket_id) {
-                        Some(conn) => {
-                            if closed {
-                                conn.teardown();
-                            } else if let Some(bytes) = pwd.buffer {
-                                let _ = conn.write_tx.send(bytes);
+            PORT_FORWARD_HEADER => {
+                let Ok(pwd) = PortForwardData::decode_from_slice(packet.payload()) else {
+                    return;
+                };
+                let Some(socket_id) = pwd.socketid.map(|v| v as u32) else { return };
+                let closed = pwd.closed.unwrap_or(false) || pwd.error.is_some();
+                let sourcetodestination = pwd.sourcetodestination.unwrap_or(false);
+                let (table, mirror_flag) = if sourcetodestination {
+                    // Peer's source data → our destination connection.
+                    (&mut self.destinations, true)
+                } else {
+                    // Peer's destination data → our source connection.
+                    (&mut self.source_sockets, false)
+                };
+                match table.remove(&socket_id) {
+                    Some(conn) => {
+                        if closed {
+                            conn.teardown();
+                        } else if let Some(bytes) = pwd.buffer {
+                            if conn.write_tx.send(bytes).await.is_ok() {
                                 // keep the connection registered
                                 table.insert(socket_id, conn);
                             } else {
-                                table.insert(socket_id, conn);
+                                // The local write half is gone (the writer
+                                // task died on a failed write): tear the
+                                // tunnel down and mirror the close so the
+                                // peer stops pumping into a dead socket.
+                                conn.teardown();
+                                let _ =
+                                    outbound.send(closed_packet(socket_id, mirror_flag)).await;
                             }
+                        } else {
+                            table.insert(socket_id, conn);
                         }
-                        None => {
-                            if closed {
-                                // Mirror the close back so the peer stops
-                                // pumping even if our side already died.
-                                let _ = outbound.send(closed_packet(socket_id, mirror_flag));
-                            }
+                    }
+                    None => {
+                        if closed {
+                            // Mirror the close back so the peer stops
+                            // pumping even if our side already died.
+                            let _ = outbound.send(closed_packet(socket_id, mirror_flag)).await;
                         }
                     }
                 }
-                _ => {}
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The engine task's channel endpoints.
+struct EngineChannels {
+    inbound: mpsc::UnboundedReceiver<Packet>,
+    cmd_rx: mpsc::Receiver<Cmd>,
+    outbound: mpsc::Sender<Packet>,
+    events: mpsc::Receiver<Event>,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+async fn run(
+    mut state: EngineState,
+    answer_destinations: bool,
+    chans: EngineChannels,
+) {
+    let EngineChannels {
+        mut inbound,
+        mut cmd_rx,
+        outbound,
+        mut events,
+        shutdown_tx,
+        shutdown_rx,
+    } = chans;
+
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(Cmd::AddSources { sources: new_sources, reply }) => {
+                    let base = state.sources.len();
+                    let (listeners, bind_errors) =
+                        bind_source_listeners(&new_sources, base).await;
+                    state.sources.extend(new_sources);
+                    for (source_idx, listener) in listeners {
+                        spawn_accept_task(
+                            listener,
+                            source_idx,
+                            state.events_tx.clone(),
+                            shutdown_rx.clone(),
+                        );
+                    }
+                    let _ = reply.send(bind_errors);
+                }
+                // Explicit shutdown, or every handle dropped.
+                Some(Cmd::Shutdown) | None => break,
+            },
+            packet = inbound.recv() => match packet {
+                Some(packet) => {
+                    state.handle_peer_packet(packet, answer_destinations, &outbound).await
+                }
+                None => break,
+            },
+            event = events.recv() => match event {
+                Some(event) => match event {
+                    Event::Accepted { source_idx, stream } => {
+                        state.handle_accepted(source_idx, stream, &outbound).await
+                    }
+                    Event::Read { conn_id, result } => {
+                        state.handle_read(conn_id, result, &outbound).await
+                    }
+                },
+                None => break,
             },
         }
     }
+
+    // Shutdown cascade: signal the accept tasks, then tear everything down.
+    let _ = shutdown_tx.send(true);
+    state.teardown_all();
 }
 
 /// Upstream `createDestination`: connect `::1:port` then `127.0.0.1:port`
@@ -527,7 +700,7 @@ async fn run(
 async fn create_destination(
     request: &PortForwardDestinationRequest,
     destinations: &mut HashMap<u32, Conn>,
-    events: &mpsc::UnboundedSender<Event>,
+    events: &mpsc::Sender<Event>,
 ) -> PortForwardDestinationResponse {
     let Some(port) = request.destination.as_option().and_then(|d| d.port) else {
         return PortForwardDestinationResponse {
@@ -543,9 +716,9 @@ async fn create_destination(
             ..Default::default()
         };
     };
-    let stream = match TcpStream::connect(("::1", port as u16)).await {
+    let stream = match TcpStream::connect(("::1", port)).await {
         Ok(s) => Some(s),
-        Err(_) => TcpStream::connect(("127.0.0.1", port as u16)).await.ok(),
+        Err(_) => TcpStream::connect(("127.0.0.1", port)).await.ok(),
     };
     let Some(stream) = stream else {
         return PortForwardDestinationResponse {
@@ -766,7 +939,7 @@ mod tests {
         )
     }
 
-    async fn next_outbound(rx: &mut mpsc::UnboundedReceiver<Packet>) -> Packet {
+    async fn next_outbound(rx: &mut mpsc::Receiver<Packet>) -> Packet {
         timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("timed out waiting for an engine frame")
@@ -805,6 +978,81 @@ mod tests {
         let (_, _, errors) = EngineHandle::spawn(vec![source_request(port)], false).await;
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains(&format!("127.0.0.1:{port}")), "{errors:?}");
+    }
+
+    /// Dropping every handle is a shutdown: the engine task ends, the
+    /// outbound channel closes, and source listeners are released.
+    #[tokio::test]
+    async fn dropping_every_handle_stops_the_engine_and_releases_listeners() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (handle, mut outbound, errors) =
+            EngineHandle::spawn(vec![source_request(port)], false).await;
+        assert!(errors.is_empty(), "{errors:?}");
+        let _conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        drop(handle);
+        drop(_conn);
+
+        let drained = timeout(Duration::from_secs(2), async {
+            while outbound.recv().await.is_some() {}
+        })
+        .await;
+        assert!(drained.is_ok(), "the outbound channel must close when the engine stops");
+
+        let rebound =
+            timeout(Duration::from_secs(2), TcpListener::bind(("127.0.0.1", port))).await;
+        assert!(rebound.is_ok(), "the listener must be released after the engine stops");
+    }
+
+    /// Explicit `shutdown()` stops the engine even while a handle is held.
+    #[tokio::test]
+    async fn explicit_shutdown_stops_the_engine_and_releases_listeners() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (handle, mut outbound, errors) =
+            EngineHandle::spawn(vec![source_request(port)], false).await;
+        assert!(errors.is_empty(), "{errors:?}");
+
+        handle.shutdown().await;
+
+        let drained = timeout(Duration::from_secs(2), async {
+            while outbound.recv().await.is_some() {}
+        })
+        .await;
+        assert!(drained.is_ok(), "the outbound channel must close after shutdown()");
+
+        let rebound =
+            timeout(Duration::from_secs(2), TcpListener::bind(("127.0.0.1", port))).await;
+        assert!(rebound.is_ok(), "the listener must be released after shutdown()");
+    }
+
+    /// Sources can be bound into an already-running engine: the session
+    /// layer uses this so a reverse-tunnel session (which auto-spawns a
+    /// destinations-only engine) can still add local forward sources.
+    #[tokio::test]
+    async fn add_sources_binds_new_listeners_on_a_running_engine() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), false).await;
+
+        let errors = handle.add_sources(vec![source_request(port)]).await;
+        assert!(errors.is_empty(), "{errors:?}");
+
+        // The new listener routes accepts into the engine.
+        let _conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let packet = next_outbound(&mut outbound).await;
+        assert_eq!(packet.header(), DESTINATION_REQUEST_HEADER);
+        let request = PortForwardDestinationRequest::decode_from_slice(packet.payload()).unwrap();
+        assert_eq!(request.fd, Some(1), "the first accepted conn gets conn id 1");
+
+        // Bind failures are reported like at spawn time.
+        let taken = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let taken_port = taken.local_addr().unwrap().port();
+        let errors = handle.add_sources(vec![source_request(taken_port)]).await;
+        assert_eq!(errors.len(), 1, "{errors:?}");
     }
 
     #[tokio::test]
