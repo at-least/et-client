@@ -44,6 +44,8 @@ pub enum TunnelParseError {
     HalfRange,
     #[error("invalid tunnel argument '{0}': {1}")]
     Invalid(String, String),
+    #[error("port {0} is out of range (must be 0-65535)")]
+    PortOutOfRange(i64),
     #[error("unix-socket forwarding ('{0}') is not supported in this build")]
     UnsupportedSocket(String),
 }
@@ -73,10 +75,7 @@ pub fn parse_ranges(input: &str) -> Result<Vec<PortForwardSourceRequest>, Tunnel
             process_et_style(&mut out, &parts, input)?;
         } else {
             let ssh = parse_ssh_tunnel_arg(element)?;
-            let port = |v: &String| {
-                v.parse()
-                    .map_err(|_| TunnelParseError::Invalid(input.into(), "bad port".into()))
-            };
+            let port = |v: &String| parse_port(v, input);
             out.push(PortForwardSourceRequest {
                 source: crate::SocketEndpoint {
                     name: Some(ssh[0].clone()),
@@ -156,8 +155,12 @@ fn process_et_style(
 }
 
 fn parse_port(v: &str, input: &str) -> Result<i32, TunnelParseError> {
-    v.parse()
-        .map_err(|_| TunnelParseError::Invalid(input.into(), "bad port".into()))
+    let port: i64 =
+        v.parse().map_err(|_| TunnelParseError::Invalid(input.into(), "bad port".into()))?;
+    if !(0..=65535).contains(&port) {
+        return Err(TunnelParseError::PortOutOfRange(port));
+    }
+    Ok(port as i32)
 }
 
 fn parse_ssh_tunnel_arg(input: &str) -> Result<Vec<String>, TunnelParseError> {
@@ -533,6 +536,13 @@ async fn create_destination(
             ..Default::default()
         };
     };
+    let Ok(port) = u16::try_from(port) else {
+        return PortForwardDestinationResponse {
+            clientfd: request.fd,
+            error: Some(format!("destination port {port} is out of range (must be 0-65535)")),
+            ..Default::default()
+        };
+    };
     let stream = match TcpStream::connect(("::1", port as u16)).await {
         Ok(s) => Some(s),
         Err(_) => TcpStream::connect(("127.0.0.1", port as u16)).await.ok(),
@@ -677,6 +687,30 @@ mod tests {
         ));
     }
 
+    /// Ports outside 0-65535 must be rejected loudly: binding with a
+    /// silently truncated `port as u16` would listen on a port nobody
+    /// asked for (upstream's getaddrinfo fails loudly here).
+    #[test]
+    fn out_of_range_ports_are_rejected_not_truncated() {
+        for input in ["70000:80", "80:70000", "65536:65536"] {
+            assert!(
+                matches!(
+                    parse_ranges(input),
+                    Err(TunnelParseError::PortOutOfRange(_))
+                ),
+                "{input} must be rejected as out of range"
+            );
+        }
+        // ssh-style arg positions are validated too.
+        assert!(matches!(
+            parse_ranges("127.0.0.1:70000:example.com:80"),
+            Err(TunnelParseError::PortOutOfRange(_))
+        ));
+        // Boundary values keep working.
+        assert!(parse_ranges("65535:0").is_ok());
+        assert!(parse_ranges("0:65535").is_ok());
+    }
+
     // ---- engine ----
 
     fn endpoint(port: u16) -> crate::SocketEndpoint {
@@ -696,10 +730,19 @@ mod tests {
     }
 
     fn destination_request(fd: i32, port: u16) -> Packet {
+        destination_request_i32(fd, port as i32)
+    }
+
+    fn destination_request_i32(fd: i32, port: i32) -> Packet {
         Packet::new(
             DESTINATION_REQUEST_HEADER,
             PortForwardDestinationRequest {
-                destination: endpoint(port).into(),
+                destination: crate::SocketEndpoint {
+                    name: Some("127.0.0.1".into()),
+                    port: Some(port),
+                    ..Default::default()
+                }
+                .into(),
                 fd: Some(fd),
                 ..Default::default()
             }
@@ -797,6 +840,22 @@ mod tests {
         assert!(response.socketid.is_none(), "nothing was opened");
         let error = response.error.expect("a connect failure");
         assert!(error.contains("could not connect"), "{error}");
+    }
+
+    /// A peer-supplied destination port outside 0-65535 is refused without
+    /// attempting a truncated `port as u16` loopback connection.
+    #[tokio::test]
+    async fn destination_requests_with_out_of_range_ports_are_refused() {
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+        handle.send(destination_request_i32(3, 70000));
+        let response = PortForwardDestinationResponse::decode_from_slice(
+            next_outbound(&mut outbound).await.payload(),
+        )
+        .unwrap();
+        assert_eq!(response.clientfd, Some(3));
+        assert!(response.socketid.is_none(), "nothing was opened");
+        let error = response.error.expect("a refusal reason");
+        assert!(error.contains("out of range"), "{error}");
     }
 
     /// The destination role end to end without a peer: DESTINATION_REQUEST
