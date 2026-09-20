@@ -399,8 +399,16 @@ impl BackedActor {
             Some(live) => {
                 let mut frame = (serialized.len() as u32).to_be_bytes().to_vec();
                 frame.extend_from_slice(&serialized);
-                if live.write_tx.send(frame).await.is_err() {
-                    // WROTE_WITH_FAILURE: the bytes are backed up either way.
+                if live.write_tx.try_send(frame).is_err() {
+                    // WROTE_WITH_FAILURE: the bytes are backed up either
+                    // way, and catch-up resends anything the queue never
+                    // took. A full queue means the writer task is wedged
+                    // in `write_all` on a socket that stopped draining:
+                    // kill it instead of blocking the actor here, which
+                    // would freeze keepalive enforcement and the recover
+                    // exchange (upstream's reader thread would keep
+                    // running; this actor must not depend on socket
+                    // progress to stay alive).
                     self.close_current_socket();
                 }
                 self.last_activity = Instant::now();
@@ -994,5 +1002,34 @@ mod tests {
             timeout(Duration::from_millis(300), rig.events.recv()).await.is_err(),
             "keepalive loss disconnects but does not kill the session"
         );
+    }
+
+    /// A peer that stops reading wedges the writer task in `write_all`;
+    /// once the socket's write queue fills, a write must kill the socket
+    /// instead of blocking the actor — SocketDown surfaces (the supervisor
+    /// can reconnect), writes keep succeeding (buffered), and the unsent
+    /// frame stays in the backup for catch-up.
+    #[tokio::test]
+    async fn a_full_socket_write_queue_kills_the_socket_instead_of_blocking_the_actor() {
+        let mut rig = rig(None).await;
+        // The peer accepts but never reads: kernel buffers fill, the
+        // writer task stalls, the queue fills.
+        let mut peer = rig.accept().await;
+
+        // 32 MiB: past the kernel buffers and the 1024-frame queue.
+        for _ in 0..2048 {
+            rig.backed.write(1, vec![0u8; 16 * 1024]).await.unwrap();
+        }
+
+        match timeout(LONG, rig.events.recv()).await {
+            Ok(Some(BackedEvent::SocketDown)) => {}
+            other => panic!("expected SocketDown once the write queue filled, got {other:?}"),
+        }
+        assert_eq!(
+            rig.backed.write(2, b"still buffered".to_vec()).await,
+            Ok(()),
+            "writes buffer while disconnected"
+        );
+        drop(peer);
     }
 }
