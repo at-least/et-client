@@ -7,6 +7,8 @@
 //! format — this directory must never be edited by hand.
 
 // The generator emits hand-rolled `impl Default` for enums (first proto
-// value); silence the lints against generated code here, never in et.rs.
+// value) and is not rustfmt-clean; silence the lints and the formatter
+// against generated code here, never in et.rs.
 #[allow(clippy::derivable_impls, clippy::all)]
+#[rustfmt::skip]
 pub mod et;
