@@ -18,6 +18,7 @@
 //! ports (upstream clients would).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -234,14 +235,16 @@ const OUTBOUND_QUEUE_DEPTH: usize = 256;
 /// frames to write back to the session. The engine stops — listeners
 /// released, connections torn down, outbound closed — on [`shutdown`]
 /// (EngineHandle::shutdown) or when every handle clone is dropped.
-#[derive(Clone)]
 pub struct EngineHandle {
     inbound: mpsc::UnboundedSender<Packet>,
     cmd_tx: mpsc::Sender<Cmd>,
     shutdown_tx: watch::Sender<bool>,
-    /// Strong-count of this arc is the number of live handle clones; the
-    /// Drop impl raises the shutdown watch on the transition to zero.
-    handle_count: Arc<()>,
+    /// Live handle-clone count; the Drop impl raises the shutdown watch on
+    /// the transition to zero. An explicit atomic, not `Arc::strong_count`:
+    /// concurrent drops can each observe the pre-decrement strong count, so
+    /// neither would fire and a congested engine (whose only data-path
+    /// preempt is the watch) would run forever.
+    handle_count: Arc<AtomicUsize>,
 }
 
 /// Commands into the engine task.
@@ -295,7 +298,7 @@ impl EngineHandle {
                 inbound,
                 cmd_tx,
                 shutdown_tx,
-                handle_count: Arc::new(()),
+                handle_count: Arc::new(AtomicUsize::new(1)),
             },
             outbound_rx,
             bind_errors,
@@ -367,11 +370,25 @@ impl EngineHandle {
     }
 }
 
+impl Clone for EngineHandle {
+    fn clone(&self) -> Self {
+        // Relaxed: the count guards only the drop transition to zero, and
+        // the decrement side orders that decision.
+        self.handle_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inbound: self.inbound.clone(),
+            cmd_tx: self.cmd_tx.clone(),
+            shutdown_tx: self.shutdown_tx.clone(),
+            handle_count: self.handle_count.clone(),
+        }
+    }
+}
+
 impl Drop for EngineHandle {
     fn drop(&mut self) {
         // Last handle gone: raise the watch so the run loop's blocked
         // sends abandon even before the command channel's close is seen.
-        if Arc::strong_count(&self.handle_count) == 1 {
+        if self.handle_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             let _ = self.shutdown_tx.send(true);
         }
     }
@@ -1641,6 +1658,65 @@ mod tests {
         assert!(
             drained.is_ok(),
             "the engine must stop on last-handle drop even while congested"
+        );
+    }
+
+    /// Dropping the last handle clones *concurrently* must still stop the
+    /// engine exactly once. An `Arc::strong_count == 1` check cannot make
+    /// that call: two drops on different workers can each observe the
+    /// pre-decrement count, neither raises the watch, and a congested
+    /// engine (whose only data-path preempt is that watch) runs forever.
+    /// The count is therefore an explicit atomic; this test pins that
+    /// contract with a barrier-synchronized mass drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_last_handle_drops_stop_a_congested_engine() {
+        let service = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let service_port = service.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_sock, _) = service.accept().await.unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+        handle.send(destination_request(1, service_port));
+        let response = PortForwardDestinationResponse::decode_from_slice(
+            next_outbound(&mut outbound).await.payload(),
+        )
+        .unwrap();
+        let socket_id = response.socketid.expect("the destination opened");
+        for _ in 0..1024 {
+            handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Eight clones, all released at one barrier and dropped at once;
+        // the original handle is already gone, so these are the last ones.
+        let clones: Vec<_> = (0..8).map(|_| handle.clone()).collect();
+        drop(handle);
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let drops: Vec<_> = clones
+            .into_iter()
+            .map(|clone| {
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    drop(clone);
+                })
+            })
+            .collect();
+        for d in drops {
+            d.await.unwrap();
+        }
+
+        let drained = timeout(Duration::from_secs(2), async {
+            while outbound.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "concurrent drops of the last clones must stop the engine"
         );
     }
 }
