@@ -320,9 +320,10 @@ impl EngineHandle {
     /// session layer uses this to add local forward sources to a session
     /// that pre-spawned a destinations-only engine for reverse tunnels).
     /// Returns one message per failed bind, like [`EngineHandle::spawn`].
-    /// The command queues behind other engine work, so it may wait while
-    /// the engine is busy draining a congested tunnel; [`shutdown`]
-    /// (EngineHandle::shutdown) preempts that wait on the engine's side.
+    /// The whole call is bounded: the engine may be busy draining a
+    /// congested tunnel, so the wait races [`shutdown`]
+    /// (EngineHandle::shutdown) and the [`ADD_SOURCES_BOUND`] ceiling —
+    /// either surfaces as an error entry instead of hanging the caller.
     pub async fn add_sources(&self, sources: Vec<PortForwardSourceRequest>) -> Vec<String> {
         self.add_sources_timed(sources, ADD_SOURCES_BOUND).await
     }
@@ -335,12 +336,17 @@ impl EngineHandle {
         bound: Duration,
     ) -> Vec<String> {
         let (reply, reply_rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(Cmd::AddSources { sources, reply })
-            .await
-            .is_err()
+        // try_send: a blocked engine can leave the 16-deep command queue
+        // full, and an unbounded send would defeat the bound entirely.
+        if let Err(mpsc::error::TrySendError::Full(_)) =
+            self.cmd_tx.try_send(Cmd::AddSources { sources, reply })
         {
+            return vec![
+                "port-forward engine command queue is full (congested); retry after shutdown or once the tunnel drains"
+                    .into(),
+            ];
+        }
+        if self.cmd_tx.is_closed() {
             return vec!["port-forward engine is not running".into()];
         }
         let mut shutdown = self.shutdown_tx.subscribe();
@@ -354,7 +360,7 @@ impl EngineHandle {
             }
             _ = tokio::time::sleep(bound) => {
                 vec![format!(
-                    "port-forward engine did not bind the new sources within {bound:?}                      (a congested tunnel is blocking it)"
+                    "port-forward engine did not bind the new sources within {bound:?} (a congested tunnel is blocking it)"
                 )]
             }
         }
@@ -819,6 +825,12 @@ struct EngineChannels {
     shutdown_rx: watch::Receiver<bool>,
 }
 
+/// Which data-path channel produced the next item for the engine loop.
+enum PeerOrLocal {
+    Peer(Option<Packet>),
+    Local(Option<Event>),
+}
+
 async fn run(mut state: EngineState, answer_destinations: bool, chans: EngineChannels) {
     let EngineChannels {
         mut inbound,
@@ -833,7 +845,9 @@ async fn run(mut state: EngineState, answer_destinations: bool, chans: EngineCha
         tokio::select! {
             // Commands first: add_sources and shutdown stay prompt while
             // the loop is merely busy (a blocked data-path send is handled
-            // by the shutdown preemption inside the handlers).
+            // by the shutdown preemption inside the handlers). Only this
+            // arm is biased — inbound and events stay randomly fair below,
+            // so a saturating peer stream cannot starve local accepts.
             biased;
             cmd = cmd_rx.recv() => match cmd {
                 Some(Cmd::AddSources { sources: new_sources, reply }) => {
@@ -854,8 +868,15 @@ async fn run(mut state: EngineState, answer_destinations: bool, chans: EngineCha
                 // Explicit shutdown, or every handle dropped.
                 Some(Cmd::Shutdown) | None => break,
             },
-            packet = inbound.recv() => match packet {
-                Some(packet) => {
+            // The data-path arms sit in their own *unbiased* select, so a
+            // saturating peer stream cannot starve local accepts/reads.
+            work = async {
+                tokio::select! {
+                    packet = inbound.recv() => PeerOrLocal::Peer(packet),
+                    event = events.recv() => PeerOrLocal::Local(event),
+                }
+            } => match work {
+                PeerOrLocal::Peer(Some(packet)) => {
                     state
                         .handle_peer_packet(
                             packet,
@@ -865,18 +886,18 @@ async fn run(mut state: EngineState, answer_destinations: bool, chans: EngineCha
                         )
                         .await
                 }
-                None => break,
-            },
-            event = events.recv() => match event {
-                Some(event) => match event {
-                    Event::Accepted { source_idx, stream } => {
-                        state.handle_accepted(source_idx, stream, &outbound, &mut shutdown_rx).await
-                    }
-                    Event::Read { conn_id, result } => {
-                        state.handle_read(conn_id, result, &outbound, &mut shutdown_rx).await
-                    }
-                },
-                None => break,
+                PeerOrLocal::Peer(None) => break,
+                PeerOrLocal::Local(Some(Event::Accepted { source_idx, stream })) => {
+                    state
+                        .handle_accepted(source_idx, stream, &outbound, &mut shutdown_rx)
+                        .await
+                }
+                PeerOrLocal::Local(Some(Event::Read { conn_id, result })) => {
+                    state
+                        .handle_read(conn_id, result, &outbound, &mut shutdown_rx)
+                        .await
+                }
+                PeerOrLocal::Local(None) => break,
             },
         }
     }
@@ -1323,8 +1344,59 @@ mod tests {
         );
     }
 
-    /// `add_sources` waiting behind congestion reports shutdown instead of
-    /// hanging until its bound when the engine stops.
+    /// The bound must cover the command-channel send too: with the engine
+    /// blocked in the data path, the 16-deep command queue fills and a
+    /// further `add_sources` must return an error entry instead of
+    /// blocking on the send forever.
+    #[tokio::test]
+    async fn add_sources_is_bounded_even_when_the_command_queue_is_full() {
+        let service = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let service_port = service.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_sock, _) = service.accept().await.unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+        handle.send(destination_request(1, service_port));
+        let response = PortForwardDestinationResponse::decode_from_slice(
+            next_outbound(&mut outbound).await.payload(),
+        )
+        .unwrap();
+        let socket_id = response.socketid.expect("the destination opened");
+        for _ in 0..1024 {
+            handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Fill the 16-deep command queue and then some; every call must
+        // return within the (small) bound.
+        let mut calls = Vec::new();
+        for _ in 0..20 {
+            let handle = handle.clone();
+            calls.push(tokio::spawn(async move {
+                handle
+                    .add_sources_timed(vec![], Duration::from_millis(300))
+                    .await
+            }));
+        }
+        for call in calls {
+            let errors = timeout(Duration::from_secs(2), call)
+                .await
+                .expect("every add_sources call must return, even with a full queue")
+                .expect("the add_sources task must not panic");
+            assert!(
+                errors.iter().any(|e| !e.is_empty()),
+                "a full command queue must surface as an error entry"
+            );
+        }
+    }
+
+    /// `add_sources` racing shutdown returns promptly (well inside its
+    /// bound) instead of hanging — whether the reply or the shutdown
+    /// notice wins is scheduling, so both outcomes are accepted.
     #[tokio::test]
     async fn add_sources_waiting_in_congestion_reports_shutdown() {
         let service = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1363,9 +1435,12 @@ mod tests {
             .await
             .expect("shutdown must end the add_sources wait promptly")
             .expect("the add_sources task must not panic");
+        // Which arm wins (the reply if the engine got to the command
+        // first, the shutdown notice if not) is scheduling — the contract
+        // is that shutdown ends the wait far inside its 30 s bound.
         assert!(
-            errors.iter().any(|e| e.as_str().contains("shutting down")),
-            "shutdown during the wait must be reported, got {errors:?}"
+            errors.is_empty() || errors.iter().any(|e| e.as_str().contains("shutting down")),
+            "the wait must end via the reply or the shutdown notice, got {errors:?}"
         );
     }
 

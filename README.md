@@ -204,7 +204,8 @@ exactly this chain.
   silent infinite retry; the recover exchange is bounded at 10 s idle per
   64 KiB of catch-up with a 60 s absolute ceiling (upstream: 30 s/60 s) —
   slow-but-progressing links recover instead of livelocking, while a bogus
-  reconnect still cannot stall the victim past 60 s; the initial
+  reconnect still cannot stall the victim past 60 s (the connection actor
+  is busy for that window — writes buffer, delivery resumes after); the initial
   connect retries `INVALID_KEY` briefly while the freshly-launched
   etterminal is still registering (upstream hides the race behind ssh
   latency; a russh-driven handshake has none).
