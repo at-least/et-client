@@ -64,12 +64,14 @@ pub enum SessionEvent {
 impl SessionEvent {
     fn from_packet(packet: Packet) -> Self {
         match packet.header() {
-            terminal_packet_type::TERMINAL_BUFFER => SessionEvent::TerminalBuffer(
-                TerminalBuffer::decode_from_slice(packet.payload())
-                    .ok()
-                    .and_then(|tb| tb.buffer)
-                    .unwrap_or_default(),
-            ),
+            terminal_packet_type::TERMINAL_BUFFER => {
+                match TerminalBuffer::decode_from_slice(packet.payload()) {
+                    Ok(tb) => SessionEvent::TerminalBuffer(tb.buffer.unwrap_or_default()),
+                    // A payload that does not decode is surfaced rather
+                    // than silently rendered as empty output.
+                    Err(_) => SessionEvent::Other(packet),
+                }
+            }
             terminal_packet_type::KEEP_ALIVE => SessionEvent::KeepAlive,
             _ => SessionEvent::Other(packet),
         }
@@ -164,17 +166,24 @@ impl TerminalSession {
     /// side). Peer PF frames stop surfacing in
     /// [`TerminalSession::next_event`] and are pumped internally; bind
     /// failures are returned like upstream's
-    /// `PortForwardSourceResponse.error` (the session stays usable).
+    /// `PortForwardSourceResponse.error` (the session stays usable). When
+    /// the session pre-spawned a destinations-only engine for reverse
+    /// tunnels, the sources are bound into that running engine — forward
+    /// and reverse tunnels combine, like upstream.
     pub async fn start_port_forwarding(
         &mut self,
         sources: Vec<PortForwardSourceRequest>,
     ) -> Result<(), String> {
-        if self.pf_inbound.is_some() {
-            return Err("port forwarding already started".into());
-        }
-        let (inbound, outbound_rx, bind_errors) = EngineHandle::spawn(sources, true).await;
-        self.pf_outbound = Some(outbound_rx);
-        self.pf_inbound = Some(inbound);
+        let bind_errors = match &self.pf_inbound {
+            Some(engine) => engine.add_sources(sources).await,
+            None => {
+                let (inbound, outbound_rx, bind_errors) =
+                    EngineHandle::spawn(sources, true).await;
+                self.pf_outbound = Some(outbound_rx);
+                self.pf_inbound = Some(inbound);
+                bind_errors
+            }
+        };
         if bind_errors.is_empty() {
             Ok(())
         } else {
@@ -222,8 +231,12 @@ impl TerminalSession {
         self.client.kill_socket().await;
     }
 
-    /// End the session.
+    /// End the session. Also stops the port-forward engine, releasing its
+    /// source listeners and tearing down tunneled connections.
     pub async fn shutdown(&self) {
+        if let Some(engine) = &self.pf_inbound {
+            engine.shutdown().await;
+        }
         self.client.shutdown().await;
     }
 
@@ -269,6 +282,194 @@ impl TerminalSession {
                     }
                     Event::Dead(reason) => return Some(SessionEvent::Dead(reason)),
                 },
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use et_proto::crypto::CryptoHandler;
+    use et_proto::framing::{read_framed_packet, read_proto_frame, write_framed_packet, write_proto_frame};
+    use et_proto::{
+        CLIENT_SERVER_NONCE_MSB, ConnectRequest, ConnectResponse, ConnectStatus,
+        MAX_HANDSHAKE_PROTO_LENGTH, MAX_PACKET_LENGTH, PortForwardDestinationRequest,
+        PROTOCOL_VERSION, SERVER_CLIENT_NONCE_MSB, SocketEndpoint,
+    };
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::io::AsyncReadExt as _;
+    use tokio::net::TcpListener;
+    use tokio::time::{timeout, timeout_at};
+
+    const ID: &str = "XXXabcdefghijklmnop";
+    const PASSKEY: &str = "0123456789abcdef0123456789abcdef";
+    const LONG: Duration = Duration::from_secs(5);
+
+    /// A malformed TERMINAL_BUFFER payload must surface as `Other` instead
+    /// of being silently rendered as empty output.
+    #[test]
+    fn undecodable_terminal_buffer_surfaces_as_other() {
+        // Truncated varint: not a decodable TerminalBuffer.
+        let packet = Packet::new(terminal_packet_type::TERMINAL_BUFFER, vec![0xff, 0xff]);
+        assert!(TerminalBuffer::decode_from_slice(packet.payload()).is_err());
+        match SessionEvent::from_packet(packet) {
+            SessionEvent::Other(_) => {}
+            other => panic!("a malformed TERMINAL_BUFFER must surface as Other, got {other:?}"),
+        }
+    }
+
+    struct Rig {
+        listener: Arc<TcpListener>,
+        addr: SocketAddr,
+        peer: tokio::net::TcpStream,
+        to_client: CryptoHandler,
+        from_client: CryptoHandler,
+    }
+
+    impl Rig {
+        /// Reads one encrypted packet from the client.
+        async fn read_client_packet(&mut self) -> Packet {
+            let mut packet = read_framed_packet(&mut self.peer, MAX_PACKET_LENGTH).await.unwrap();
+            assert!(packet.is_encrypted());
+            packet.decrypt(&mut self.from_client).unwrap();
+            packet
+        }
+    }
+
+    /// Starts a session against an in-process mock server: handshake
+    /// (`NEW_CLIENT`), then the INITIAL_PAYLOAD/INITIAL_RESPONSE exchange.
+    async fn start_session(initial_payload: &InitialPayload) -> (TerminalSession, Rig) {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let addr = listener.local_addr().unwrap();
+        let (session_tx, session_rx) = tokio::sync::oneshot::channel();
+        let payload = initial_payload.clone();
+        let addr_string = addr.to_string();
+        tokio::spawn(async move {
+            let session = TerminalSession::start(
+                addr_string,
+                ID.into(),
+                PASSKEY,
+                &payload,
+                DEFAULT_KEEPALIVE,
+            )
+            .await;
+            let _ = session_tx.send(session);
+        });
+
+        let (mut peer, _) = listener.accept().await.unwrap();
+        peer.set_nodelay(true).ok();
+        let bytes = read_proto_frame(&mut peer, MAX_HANDSHAKE_PROTO_LENGTH).await.unwrap();
+        let request = ConnectRequest::decode_from_slice(&bytes).unwrap();
+        assert_eq!(request.clientId.as_deref(), Some(ID));
+        assert_eq!(request.version, Some(PROTOCOL_VERSION));
+        let response =
+            ConnectResponse { status: Some(ConnectStatus::NewClient), ..Default::default() };
+        write_proto_frame(&mut peer, &response.encode_to_vec()).await.unwrap();
+
+        let mut key = [0u8; 32];
+        key.copy_from_slice(PASSKEY.as_bytes());
+        let mut to_client = CryptoHandler::new(&key, SERVER_CLIENT_NONCE_MSB);
+        let mut from_client = CryptoHandler::new(&key, CLIENT_SERVER_NONCE_MSB);
+
+        let initial = timeout(LONG, async {
+            let mut packet = read_framed_packet(&mut peer, MAX_PACKET_LENGTH).await.unwrap();
+            assert!(packet.is_encrypted());
+            packet.decrypt(&mut from_client).unwrap();
+            assert_eq!(packet.header(), et_packet_type::INITIAL_PAYLOAD);
+            let resp = InitialResponse { error: None, ..Default::default() };
+            let mut p = Packet::new(et_packet_type::INITIAL_RESPONSE, resp.encode_to_vec());
+            p.encrypt(&mut to_client);
+            write_framed_packet(&mut peer, &p).await.unwrap();
+        })
+        .await
+        .expect("the INITIAL exchange must complete");
+        let _ = initial;
+
+        let session = timeout(LONG, session_rx).await.unwrap().unwrap().unwrap();
+        (session, Rig { listener, addr, peer, to_client, from_client })
+    }
+
+    fn source_request(port: u16) -> PortForwardSourceRequest {
+        PortForwardSourceRequest {
+            source: SocketEndpoint {
+                name: Some("127.0.0.1".into()),
+                port: Some(port as i32),
+                ..Default::default()
+            }
+            .into(),
+            destination: SocketEndpoint {
+                name: Some("127.0.0.1".into()),
+                port: Some(1),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    async fn free_port() -> u16 {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        probe.local_addr().unwrap().port()
+    }
+
+    /// A session whose INITIAL_PAYLOAD declared reverse tunnels auto-spawns
+    /// a destinations-only engine; `start_port_forwarding` must add local
+    /// sources into the running engine instead of failing with "already
+    /// started" (upstream supports `-t` and `-r` together).
+    #[tokio::test]
+    async fn forward_sources_can_be_added_to_a_reverse_tunnel_session() {
+        let payload =
+            InitialPayload { reversetunnels: vec![PortForwardSourceRequest::default()], ..Default::default() };
+        let (mut session, mut rig) = start_session(&payload).await;
+        let port = free_port().await;
+
+        session
+            .start_port_forwarding(vec![source_request(port)])
+            .await
+            .expect("adding forward sources to a reverse-tunnel session must work");
+
+        // The source is really bound: a local connection reaches the peer
+        // as a DESTINATION_REQUEST once the session pump runs.
+        let _conn = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let driver = tokio::spawn(async move {
+            while session.next_event().await.is_some() {}
+        });
+        let request = timeout(LONG, async {
+            loop {
+                let packet = rig.read_client_packet().await;
+                if packet.header() == DESTINATION_REQUEST_HEADER {
+                    break packet;
+                }
+            }
+        })
+        .await
+        .expect("the accepted connection must produce a DESTINATION_REQUEST");
+        let pf = PortForwardDestinationRequest::decode_from_slice(request.payload()).unwrap();
+        assert!(pf.fd.is_some(), "{pf:?}");
+        driver.abort();
+    }
+
+    /// `shutdown()` ends the session *and* stops the port-forward engine:
+    /// the source listener is released.
+    #[tokio::test]
+    async fn shutdown_releases_the_port_forward_listener() {
+        let (mut session, _rig) = start_session(&InitialPayload::default()).await;
+        let port = free_port().await;
+        session.start_port_forwarding(vec![source_request(port)]).await.unwrap();
+
+        session.shutdown().await;
+
+        // The listener must stop accepting (macOS SO_REUSEADDR allows
+        // re-binding a live port, so acceptance is the observable).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match timeout_at(deadline, tokio::net::TcpStream::connect(("127.0.0.1", port))).await
+            {
+                Err(_) => panic!("the PF listener must stop accepting after shutdown()"),
+                Ok(Ok(_conn)) => continue, // still up; recheck until the deadline
+                Ok(Err(_)) => break,       // refused: listener released
             }
         }
     }
