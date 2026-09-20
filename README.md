@@ -201,8 +201,10 @@ exactly this chain.
   fails fast with a clear error instead of wedging ~60 s (a fresh client's
   nonce phase cannot resume a live stream); a reconnect answered
   `NEW_CLIENT` ends the session with `ServerStateLost` instead of upstream's
-  silent infinite retry; the recover exchange is capped at 10 s (not 60) to
-  bound how long a bogus reconnect stalls the victim's writes; the initial
+  silent infinite retry; the recover exchange is bounded at 10 s idle per
+  64 KiB of catch-up with a 60 s absolute ceiling (upstream: 30 s/60 s) —
+  slow-but-progressing links recover instead of livelocking, while a bogus
+  reconnect still cannot stall the victim past 60 s; the initial
   connect retries `INVALID_KEY` briefly while the freshly-launched
   etterminal is still registering (upstream hides the race behind ssh
   latency; a russh-driven handshake has none).

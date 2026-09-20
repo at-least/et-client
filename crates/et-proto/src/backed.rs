@@ -30,7 +30,6 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::crypto::CryptoHandler;
-use crate::framing::{read_proto_frame, write_proto_frame};
 use crate::gen::et::{CatchupBuffer, SequenceHeader};
 use crate::packet::Packet;
 use crate::{
@@ -39,24 +38,27 @@ use crate::{
 use buffa::Message as _;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
 
 /// Upstream `BackedWriter::MAX_BACKUP_BYTES`.
 pub const MAX_BACKUP_BYTES: i64 = 64 * 1024 * 1024;
 /// Upstream `BackedWriter::DISCONNECT_BUFFER_BYTES`.
 pub const DISCONNECT_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
-/// Ceiling for every recover exchange. Upstream bounds each handshake read
-/// at 30 s idle / 60 s absolute; a shorter ceiling bounds how long a bogus
-/// reconnect (anyone who knows the id can trigger one) stalls the victim's
-/// writes, which upstream blocks for the full window.
-///
-/// Known trade-off: on a link too slow to push a large missed backlog
-/// within this window, recovery times out and retries indefinitely
-/// (writes keep buffering, bounded by `DISCONNECT_BUFFER_BYTES`) — a
-/// reconnect livelock where upstream's longer window might resynchronize.
-/// Chosen deliberately: the short ceiling bounds how long a bogus
-/// reconnect blocks the actor.
-pub const RECOVER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-IO-step idle bound during the recover exchange: every 64 KiB
+/// chunk of the catch-up must complete within this window. Upstream
+/// bounds each handshake read at 30 s idle; 10 s keeps the short ceiling
+/// on how long a bogus reconnect (anyone who knows the id can start the
+/// plaintext exchange) can stall the victim, while a slow link that
+/// keeps making progress still recovers instead of livelocking on
+/// retries.
+pub const RECOVER_STEP_IDLE: Duration = Duration::from_secs(10);
+/// Absolute ceiling for the whole recover exchange — upstream's own bound
+/// (the C++ peer abandons the exchange at 60 s absolute, so waiting
+/// longer can never succeed). It also bounds how long a trickling peer
+/// can hold the exchange open reading out backed-up ciphertext.
+pub const RECOVER_ABSOLUTE: Duration = Duration::from_secs(60);
+/// Recover-exchange IO chunk: each chunk must complete within one
+/// [`RECOVER_STEP_IDLE`] window (~6.5 KiB/s minimum sustainable rate).
+const RECOVER_IO_CHUNK: usize = 64 * 1024;
 const WRITE_QUEUE_DEPTH: usize = 1024;
 const EVENT_QUEUE_DEPTH: usize = 1024;
 
@@ -101,6 +103,8 @@ enum Cmd {
     Recover {
         stream: TcpStream,
         reply: oneshot::Sender<bool>,
+        idle: Duration,
+        absolute: Duration,
     },
     Shutdown,
 }
@@ -165,12 +169,26 @@ impl BackedHandle {
     /// `Connection::recover` over a socket whose handshake answered
     /// `RETURNING_CLIENT`. Returns `true` when the socket went live.
     pub async fn recover(&self, stream: TcpStream) -> bool {
+        self.recover_timed(stream, RECOVER_STEP_IDLE, RECOVER_ABSOLUTE)
+            .await
+    }
+
+    /// Timing-injectable [`BackedHandle::recover`] (tests drive small
+    /// windows); production callers take the documented constants.
+    pub(crate) async fn recover_timed(
+        &self,
+        stream: TcpStream,
+        idle: Duration,
+        absolute: Duration,
+    ) -> bool {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .cmd_tx
             .send(Cmd::Recover {
                 stream,
                 reply: reply_tx,
+                idle,
+                absolute,
             })
             .await
             .is_err()
@@ -301,8 +319,8 @@ impl BackedActor {
                         let _ = reply.send(result);
                     }
                     Some(Cmd::KillSocket) => self.close_current_socket(),
-                    Some(Cmd::Recover { stream, reply }) => {
-                        let ok = self.recover(stream).await;
+                    Some(Cmd::Recover { stream, reply, idle, absolute }) => {
+                        let ok = self.recover_timed_actor(stream, idle, absolute).await;
                         let _ = reply.send(ok);
                     }
                     // Channel closed: every handle was dropped.
@@ -479,25 +497,31 @@ impl BackedActor {
 
     /// `Connection::recover`, the identical exchange both peers run:
     /// write my reader seq → read their reader seq → write my catch-up →
-    /// read their catch-up. On failure the old socket (if any) is restored
-    /// untouched, so a bogus reconnect cannot force-disconnect a live
-    /// session (upstream `recoverClient` guarantee).
-    async fn recover(&mut self, stream: TcpStream) -> bool {
+    /// read their catch-up. Every IO step is bounded by `idle`, the whole
+    /// exchange by `absolute`: a slow-but-progressing peer recovers, a
+    /// stalled or trickling one is abandoned. On failure the old socket
+    /// (if any) is restored untouched, so a bogus reconnect cannot
+    /// force-disconnect a live session (upstream `recoverClient`
+    /// guarantee).
+    async fn recover_timed_actor(
+        &mut self,
+        stream: TcpStream,
+        idle: Duration,
+        absolute: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + absolute;
         let exchange = async {
             let mut stream = stream;
             let sh = SequenceHeader {
                 sequenceNumber: Some(self.reader_seq as i32),
                 ..Default::default()
             };
-            write_proto_frame(&mut stream, &sh.encode_to_vec())
-                .await
-                .map_err(|e| e.to_string())?;
+            write_frame_idle(&mut stream, &sh.encode_to_vec(), idle, deadline).await?;
 
-            let bytes = read_proto_frame(&mut stream, MAX_HANDSHAKE_PROTO_LENGTH)
-                .await
-                .map_err(|e| e.to_string())?;
-            let remote = SequenceHeader::decode_from_slice(&bytes)
-                .map_err(|e| format!("bad SequenceHeader: {e}"))?;
+            let remote = SequenceHeader::decode_from_slice(
+                &read_frame_idle(&mut stream, MAX_HANDSHAKE_PROTO_LENGTH, idle, deadline).await?,
+            )
+            .map_err(|e| format!("bad SequenceHeader: {e}"))?;
             let remote_seq = remote.sequenceNumber.unwrap_or(0);
 
             // `BackedWriter::recover`: newest `writer_seq - remote_seq`
@@ -525,21 +549,18 @@ impl BackedActor {
                     .collect();
                 catchup.buffer.reverse();
             }
-            write_proto_frame(&mut stream, &catchup.encode_to_vec())
-                .await
-                .map_err(|e| e.to_string())?;
+            write_frame_idle(&mut stream, &catchup.encode_to_vec(), idle, deadline).await?;
 
-            let bytes = read_proto_frame(&mut stream, DEFAULT_MAX_PROTO_LENGTH)
-                .await
-                .map_err(|e| e.to_string())?;
-            let their_catchup = CatchupBuffer::decode_from_slice(&bytes)
+            let their_bytes =
+                read_frame_idle(&mut stream, DEFAULT_MAX_PROTO_LENGTH, idle, deadline).await?;
+            let their_catchup = CatchupBuffer::decode_from_slice(&their_bytes)
                 .map_err(|e| format!("bad CatchupBuffer: {e}"))?;
             Ok((stream, their_catchup.buffer))
         };
 
         let old = self.live.take();
-        match timeout(RECOVER_TIMEOUT, exchange).await {
-            Ok(Ok((stream, entries))) => {
+        match exchange.await {
+            Ok((stream, entries)) => {
                 drop(old); // close the superseded socket
                            // `BackedReader::revive` + `BackedWriter::revive`.
                 self.inbox.extend(entries);
@@ -548,7 +569,7 @@ impl BackedActor {
                 self.live = Some(self.spawn_socket_tasks(stream));
                 true
             }
-            Ok(Err(_)) | Err(_) => {
+            Err(_) => {
                 // Restore the previous socket untouched (`recoverClient`'s
                 // victim protection).
                 self.live = old;
@@ -558,10 +579,91 @@ impl BackedActor {
     }
 }
 
+/// One `i64`-LE framed write with progress-bounded IO: each
+/// [`RECOVER_IO_CHUNK`] slice must complete within `idle`, everything
+/// within `deadline`.
+///
+/// Cancel-unsafety is fine here by construction: a timeout abandons the
+/// whole exchange and the stream is dropped, so the unknown number of
+/// bytes a dropped `write_all` already pushed is never resumed.
+async fn write_frame_idle<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    body: &[u8],
+    idle: Duration,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    let header = (body.len() as i64).to_le_bytes();
+    write_all_idle(w, &header, idle, deadline).await?;
+    write_all_idle(w, body, idle, deadline).await
+}
+
+async fn write_all_idle<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    buf: &[u8],
+    idle: Duration,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut off = 0;
+    while off < buf.len() {
+        let end = (off + RECOVER_IO_CHUNK).min(buf.len());
+        let step_bound = (tokio::time::Instant::now() + idle).min(deadline);
+        match tokio::time::timeout_at(step_bound, w.write_all(&buf[off..end])).await {
+            Ok(Ok(())) => off = end,
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => return Err("recover exchange stalled (idle window exceeded)".into()),
+        }
+    }
+    Ok(())
+}
+
+/// One `i64`-LE framed read with progress-bounded IO (see
+/// [`write_frame_idle`]); `max_len` mirrors `read_proto_frame`'s bound.
+async fn read_frame_idle<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    max_len: i64,
+    idle: Duration,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, String> {
+    let mut len_buf = [0u8; 8];
+    read_exact_idle(r, &mut len_buf, idle, deadline).await?;
+    let len = i64::from_le_bytes(len_buf);
+    if !(0..=max_len).contains(&len) {
+        return Err(format!(
+            "recover exchange frame of {len} bytes exceeds the maximum"
+        ));
+    }
+    let mut body = vec![0u8; len as usize];
+    read_exact_idle(r, &mut body, idle, deadline).await?;
+    Ok(body)
+}
+
+async fn read_exact_idle<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    buf: &mut [u8],
+    idle: Duration,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    use tokio::io::AsyncReadExt as _;
+    let mut off = 0;
+    while off < buf.len() {
+        let end = (off + RECOVER_IO_CHUNK).min(buf.len());
+        let step_bound = (tokio::time::Instant::now() + idle).min(deadline);
+        match tokio::time::timeout_at(step_bound, r.read_exact(&mut buf[off..end])).await {
+            Ok(Ok(_)) => off = end,
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => return Err("recover exchange stalled (idle window exceeded)".into()),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::framing::{read_framed_packet, write_framed_packet};
+    use crate::framing::{
+        read_framed_packet, read_proto_frame, write_framed_packet, write_proto_frame,
+    };
     use crate::{
         CLIENT_SERVER_NONCE_MSB, DEFAULT_MAX_PROTO_LENGTH, MAX_PACKET_LENGTH,
         SERVER_CLIENT_NONCE_MSB,
@@ -569,6 +671,7 @@ mod tests {
     use std::net::SocketAddr;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use tokio::time::timeout;
 
     const TEST_KEY: [u8; 32] = [0x5a; 32];
     const LONG: Duration = Duration::from_secs(5);
@@ -1156,5 +1259,290 @@ mod tests {
             "writes buffer while disconnected"
         );
         drop(peer);
+    }
+
+    // ---- recover exchange timing ----
+
+    /// Reads one i64-LE framed body in `chunk`-byte slices, delaying
+    /// between slices: a peer that keeps making progress, but slowly.
+    async fn read_frame_slowly<R: tokio::io::AsyncRead + Unpin>(
+        peer: &mut R,
+        chunk: usize,
+        delay: Duration,
+    ) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+        let mut len_buf = [0u8; 8];
+        peer.read_exact(&mut len_buf).await.unwrap();
+        let len = i64::from_le_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        let mut off = 0;
+        while off < len {
+            let end = (off + chunk).min(len);
+            peer.read_exact(&mut body[off..end]).await.unwrap();
+            off = end;
+            tokio::time::sleep(delay).await;
+        }
+        body
+    }
+
+    /// Mirror of [`read_frame_slowly`] for the peer's writes.
+    async fn write_frame_slowly<W: tokio::io::AsyncWrite + Unpin>(
+        peer: &mut W,
+        bytes: &[u8],
+        chunk: usize,
+        delay: Duration,
+    ) {
+        use tokio::io::AsyncWriteExt as _;
+        peer.write_all(&(bytes.len() as i64).to_le_bytes())
+            .await
+            .unwrap();
+        let mut off = 0;
+        while off < bytes.len() {
+            let end = (off + chunk).min(bytes.len());
+            peer.write_all(&bytes[off..end]).await.unwrap();
+            off = end;
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// A catch-up entry the client can actually decrypt: real ciphertext
+    /// from a fresh peer writer (the client's reader stream is fresh too —
+    /// the peer delivered nothing before the outage).
+    fn encrypted_entry(writer: &mut CryptoHandler, payload: &[u8]) -> Vec<u8> {
+        let mut packet = Packet::new(1, payload.to_vec());
+        packet.encrypt(writer);
+        packet.serialize()
+    }
+
+    /// A slow-but-progressing peer recovers: every 64 KiB chunk of the
+    /// catch-up lands inside the idle window even though the whole
+    /// transfer outlasts it — a single total timeout would livelock this
+    /// session on retry forever.
+    #[tokio::test]
+    async fn recover_tolerates_a_slow_but_progressing_peer() {
+        let mut rig = rig(None).await;
+        let _peer = rig.accept().await;
+        // ~512 KiB of backlog: 9+ chunks at 64 KiB.
+        for i in 0..8u8 {
+            rig.backed.write(1, vec![i; 64 * 1024]).await.unwrap();
+        }
+        rig.backed.kill_socket().await;
+        assert!(matches!(
+            rig.events.recv().await,
+            Some(BackedEvent::SocketDown)
+        ));
+
+        let recover_stream = rig.connect_extra().await;
+        let peer2 = rig.accept().await;
+        let exchange = tokio::spawn(async move {
+            // Header phase at full speed.
+            let mut peer2 = peer2;
+            let bytes = read_proto_frame(&mut peer2, MAX_HANDSHAKE_PROTO_LENGTH)
+                .await
+                .unwrap();
+            let sh = SequenceHeader::decode_from_slice(&bytes).unwrap();
+            write_proto_frame(
+                &mut peer2,
+                &SequenceHeader {
+                    sequenceNumber: Some(0),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+
+            // Full-duplex slow peer: their catch-up streams back on the
+            // write half WHILE our catch-up is still being trickled off
+            // the read half — both directions progress past the idle
+            // window chunk by chunk, without a pipeline bubble between
+            // the phases (a sequential peer's reply-start delay would
+            // itself exceed any idle window shorter than the transfer).
+            let mut entry_writer = peer_crypto().writer;
+            let entries: Vec<Vec<u8>> = (0..4)
+                .map(|i| encrypted_entry(&mut entry_writer, &[i; 64 * 1024]))
+                .collect();
+            let reply = CatchupBuffer {
+                buffer: entries,
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let (mut read_half, mut write_half) = peer2.into_split();
+            let reply_task = tokio::spawn(async move {
+                write_frame_slowly(
+                    &mut write_half,
+                    &reply,
+                    crate::backed::RECOVER_IO_CHUNK,
+                    Duration::from_millis(400),
+                )
+                .await;
+                write_half // moved back out when the task finishes
+            });
+            // Our catch-up read slowly: 64 KiB chunks, 400 ms apart —
+            // 8 chunks ≈ 3.2 s total. Keep the bytes: the test replays
+            // them below to align its mock reader's nonce phase.
+            let slow = read_frame_slowly(
+                &mut read_half,
+                crate::backed::RECOVER_IO_CHUNK,
+                Duration::from_millis(400),
+            )
+            .await;
+            let write_half = reply_task.await.unwrap();
+            (sh.sequenceNumber.unwrap(), read_half, write_half, slow)
+        });
+
+        // idle 2 s < total ≈ 5 s, per-chunk ≈ 400 ms: only progress-based
+        // bounds can carry this exchange — a single 2 s total timeout
+        // would abort it.
+        let ok = rig
+            .backed
+            .recover_timed(
+                recover_stream,
+                Duration::from_secs(2),
+                Duration::from_secs(30),
+            )
+            .await;
+        let (client_seq, mut read_half, write_half, slow) = exchange.await.unwrap();
+        assert_eq!(client_seq, 0);
+        assert!(ok, "a progressing peer must recover despite a slow link");
+
+        // The slowly-arrived catch-up is delivered, decrypted, in order.
+        let writer = peer_crypto().writer;
+        for i in 0..4u8 {
+            match timeout(LONG, rig.events.recv()).await.unwrap() {
+                Some(BackedEvent::Packet(packet)) => {
+                    assert_eq!(packet.header(), 1);
+                    assert_eq!(packet.payload(), &vec![i; 64 * 1024][..]);
+                }
+                other => panic!("expected catch-up packet {i}, got {other:?}"),
+            }
+        }
+        // And the recovered socket is live both ways. The mock reader
+        // must first replay the 8 re-sent catch-up entries (nonce 1-8)
+        // so it expects the "live" packet at the right nonce (9).
+        let mut reader = peer_crypto().reader;
+        let resent = CatchupBuffer::decode_from_slice(&slow).unwrap();
+        assert_eq!(resent.buffer.len(), 8);
+        for entry in &resent.buffer {
+            Packet::parse(entry).unwrap().decrypt(&mut reader).unwrap();
+        }
+        rig.backed.write(2, b"live".to_vec()).await.unwrap();
+        let mut wire = read_framed_packet(&mut read_half, MAX_PACKET_LENGTH)
+            .await
+            .unwrap();
+        assert!(wire.is_encrypted());
+        wire.decrypt(&mut reader).unwrap();
+        assert_eq!(wire.payload(), b"live");
+        let _ = (write_half, writer); // entries were pre-encrypted above
+    }
+
+    /// A peer that stalls mid-exchange is abandoned at the idle window —
+    /// the bogus-reconnect bound must survive the new timing scheme.
+    #[tokio::test]
+    async fn recover_abandons_a_stalled_exchange_at_the_idle_window() {
+        let mut rig = rig(None).await;
+        let _peer = rig.accept().await;
+        rig.backed.kill_socket().await;
+        assert!(matches!(
+            rig.events.recv().await,
+            Some(BackedEvent::SocketDown)
+        ));
+
+        let recover_stream = rig.connect_extra().await;
+        let peer2 = rig.accept().await;
+        // Reads our SequenceHeader, then stalls forever before replying —
+        // in its own task: the client only writes the header once
+        // `recover_timed` below starts, so an inline read would deadlock
+        // the test against itself.
+        let stalled = tokio::spawn(async move {
+            let mut peer2 = peer2;
+            let _ = read_proto_frame(&mut peer2, MAX_HANDSHAKE_PROTO_LENGTH).await;
+            // Hold the socket open, never reply.
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let ok = rig
+            .backed
+            .recover_timed(
+                recover_stream,
+                Duration::from_millis(200),
+                Duration::from_secs(30),
+            )
+            .await;
+        assert!(!ok, "a stalled peer must not recover");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the idle window must bound the stall, took {:?}",
+            started.elapsed()
+        );
+        stalled.abort();
+    }
+
+    /// Even a progressing peer is bounded by the absolute ceiling: the
+    /// exchange cannot run past it, matching the C++ peer's own 60 s
+    /// abandonment (and bounding ciphertext exfiltration by a trickling
+    /// peer).
+    #[tokio::test]
+    async fn recover_absolute_cap_binds_even_a_progressing_peer() {
+        let mut rig = rig(None).await;
+        let _peer = rig.accept().await;
+        for i in 0..8u8 {
+            rig.backed.write(1, vec![i; 64 * 1024]).await.unwrap();
+        }
+        rig.backed.kill_socket().await;
+        assert!(matches!(
+            rig.events.recv().await,
+            Some(BackedEvent::SocketDown)
+        ));
+
+        let recover_stream = rig.connect_extra().await;
+        let mut peer2 = rig.accept().await;
+        let exchange = tokio::spawn(async move {
+            let bytes = read_proto_frame(&mut peer2, MAX_HANDSHAKE_PROTO_LENGTH)
+                .await
+                .unwrap();
+            let _ = SequenceHeader::decode_from_slice(&bytes).unwrap();
+            write_proto_frame(
+                &mut peer2,
+                &SequenceHeader {
+                    sequenceNumber: Some(0),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+            // Trickle-reads our ~512 KiB catch-up: every chunk well inside
+            // the idle window, but the total outlasts the absolute cap.
+            let _slow = read_frame_slowly(
+                &mut peer2,
+                crate::backed::RECOVER_IO_CHUNK,
+                Duration::from_millis(150),
+            )
+            .await;
+        });
+
+        let started = std::time::Instant::now();
+        let ok = rig
+            .backed
+            .recover_timed(
+                recover_stream,
+                Duration::from_secs(10),
+                Duration::from_millis(600),
+            )
+            .await;
+        assert!(
+            !ok,
+            "the absolute ceiling must bind even a progressing peer"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the exchange must end near the ceiling, took {:?}",
+            started.elapsed()
+        );
+        let _ = exchange.await;
     }
 }
