@@ -166,7 +166,8 @@ impl EtClient {
                 // recover rolls back to the old socket.
                 drop(stream);
                 return Err(ConnectFailure::Protocol(
-                    "this id already has a live session on the server and a fresh client                      cannot resume it; rerun the ssh handshake to get a new id"
+                    "this id already has a live session on the server and a fresh client cannot \
+                     resume it; rerun the ssh handshake to get a new id"
                         .to_string(),
                 ));
             }
@@ -193,7 +194,15 @@ impl EtClient {
         let sup_backed = backed.clone();
         tokio::spawn(async move {
             loop {
-                match backed_events.recv().await {
+                let event = tokio::select! {
+                    event = backed_events.recv() => event,
+                    // The owner dropped the client: return so the last
+                    // handle clone drops and the backed actor's command
+                    // channel closes — without keepalive traffic or a
+                    // tick, nothing else would carry the notice.
+                    _ = events_tx.closed() => return,
+                };
+                match event {
                     Some(BackedEvent::Packet(packet)) => {
                         if events_tx.send(Event::Packet(packet)).await.is_err() {
                             return;
@@ -286,6 +295,7 @@ mod tests {
     use crate::{DEFAULT_MAX_PROTO_LENGTH, MAX_PACKET_LENGTH};
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
 
@@ -402,6 +412,26 @@ mod tests {
             matches!(err, ConnectFailure::Protocol(ref m) if m.contains("already has a live session")),
             "{err}"
         );
+    }
+
+    /// Dropping the client ends the whole stack promptly — even with
+    /// keepalive disabled (the jump-relay configuration), where no
+    /// keepalive tick or traffic would otherwise carry the notice to the
+    /// actor; the mock peer sees the socket close.
+    #[tokio::test]
+    async fn dropping_the_client_closes_the_socket_promptly_without_keepalive() {
+        let rig = server_rig().await;
+        let rx = spawn_handshake(&rig, ConnectStatus::NewClient);
+        let client =
+            EtClient::connect_with(rig.addr.to_string(), ID.into(), PASSKEY, None).await.unwrap();
+        let mut peer = rx.await.unwrap();
+        drop(client);
+
+        let mut eof = vec![0u8; 4];
+        let read = timeout(Duration::from_secs(2), peer.read_exact(&mut eof)).await;
+        let read =
+            read.expect("the socket must close within 2s of dropping the client");
+        assert!(read.is_err(), "expected EOF after the drop, got {read:?}");
     }
 
     /// Reconnect answered `NEW_CLIENT`: the server kept the key but lost
