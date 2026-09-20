@@ -229,6 +229,7 @@ const OUTBOUND_QUEUE_DEPTH: usize = 256;
 pub struct EngineHandle {
     inbound: mpsc::UnboundedSender<Packet>,
     cmd_tx: mpsc::Sender<Cmd>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 /// Commands into the engine task.
@@ -273,11 +274,19 @@ impl EngineHandle {
                 cmd_rx,
                 outbound,
                 events,
-                shutdown_tx,
+                shutdown_tx: shutdown_tx.clone(),
                 shutdown_rx,
             },
         ));
-        (EngineHandle { inbound, cmd_tx }, outbound_rx, bind_errors)
+        (
+            EngineHandle {
+                inbound,
+                cmd_tx,
+                shutdown_tx,
+            },
+            outbound_rx,
+            bind_errors,
+        )
     }
 
     pub fn send(&self, packet: Packet) {
@@ -286,8 +295,11 @@ impl EngineHandle {
 
     /// Stops the engine: source listeners are released, every tunneled
     /// connection is torn down, and the outbound channel closes. Idempotent;
-    /// also happens implicitly when every handle clone is dropped.
+    /// also happens implicitly when every handle clone is dropped. The
+    /// watch is raised here directly (not only via the command queue) so a
+    /// run loop blocked behind a congested tunnel still stops promptly.
     pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
         let _ = self.cmd_tx.send(Cmd::Shutdown).await;
     }
 
@@ -295,6 +307,9 @@ impl EngineHandle {
     /// session layer uses this to add local forward sources to a session
     /// that pre-spawned a destinations-only engine for reverse tunnels).
     /// Returns one message per failed bind, like [`EngineHandle::spawn`].
+    /// The command queues behind other engine work, so it may wait while
+    /// the engine is busy draining a congested tunnel; [`shutdown`]
+    /// (EngineHandle::shutdown) preempts that wait on the engine's side.
     pub async fn add_sources(&self, sources: Vec<PortForwardSourceRequest>) -> Vec<String> {
         let (reply, reply_rx) = oneshot::channel();
         if self
@@ -520,6 +535,7 @@ impl EngineState {
         source_idx: usize,
         stream: TcpStream,
         outbound: &mpsc::Sender<Packet>,
+        shutdown: &mut watch::Receiver<bool>,
     ) {
         let Some(destination) = self
             .sources
@@ -536,12 +552,12 @@ impl EngineState {
             fd: Some(conn_id as i32),
             ..Default::default()
         };
-        let _ = outbound
-            .send(Packet::new(
-                DESTINATION_REQUEST_HEADER,
-                request.encode_to_vec(),
-            ))
-            .await;
+        let _ = send_or_shutdown(
+            outbound,
+            Packet::new(DESTINATION_REQUEST_HEADER, request.encode_to_vec()),
+            shutdown,
+        )
+        .await;
     }
 
     async fn handle_read(
@@ -549,23 +565,29 @@ impl EngineState {
         conn_id: u32,
         result: std::io::Result<Vec<u8>>,
         outbound: &mpsc::Sender<Packet>,
+        shutdown: &mut watch::Receiver<bool>,
     ) {
         if let Some(&socket_id) = self.source_conn_ids.get(&conn_id) {
             // Source role: local reads → peer destination.
             match result {
                 Ok(bytes) if !bytes.is_empty() => {
-                    let _ = outbound.send(data_packet(socket_id, true, bytes)).await;
+                    let _ =
+                        send_or_shutdown(outbound, data_packet(socket_id, true, bytes), shutdown)
+                            .await;
                 }
                 Ok(_) => {
-                    let _ = outbound.send(closed_packet(socket_id, true)).await;
+                    let _ =
+                        send_or_shutdown(outbound, closed_packet(socket_id, true), shutdown).await;
                     if let Some(conn) = self.source_sockets.remove(&socket_id) {
                         conn.teardown();
                     }
                     self.source_conn_ids.remove(&conn_id);
                 }
                 Err(e) => {
-                    let _ = outbound.send(error_packet(socket_id, true, &e)).await;
-                    let _ = outbound.send(closed_packet(socket_id, true)).await;
+                    let _ = send_or_shutdown(outbound, error_packet(socket_id, true, &e), shutdown)
+                        .await;
+                    let _ =
+                        send_or_shutdown(outbound, closed_packet(socket_id, true), shutdown).await;
                     if let Some(conn) = self.source_sockets.remove(&socket_id) {
                         conn.teardown();
                     }
@@ -577,17 +599,23 @@ impl EngineState {
             let socket_id = conn_id;
             match result {
                 Ok(bytes) if !bytes.is_empty() => {
-                    let _ = outbound.send(data_packet(socket_id, false, bytes)).await;
+                    let _ =
+                        send_or_shutdown(outbound, data_packet(socket_id, false, bytes), shutdown)
+                            .await;
                 }
                 Ok(_) => {
-                    let _ = outbound.send(closed_packet(socket_id, false)).await;
+                    let _ =
+                        send_or_shutdown(outbound, closed_packet(socket_id, false), shutdown).await;
                     if let Some(conn) = self.destinations.remove(&socket_id) {
                         conn.teardown();
                     }
                 }
                 Err(e) => {
-                    let _ = outbound.send(error_packet(socket_id, false, &e)).await;
-                    let _ = outbound.send(closed_packet(socket_id, false)).await;
+                    let _ =
+                        send_or_shutdown(outbound, error_packet(socket_id, false, &e), shutdown)
+                            .await;
+                    let _ =
+                        send_or_shutdown(outbound, closed_packet(socket_id, false), shutdown).await;
                     if let Some(conn) = self.destinations.remove(&socket_id) {
                         conn.teardown();
                     }
@@ -602,6 +630,7 @@ impl EngineState {
         packet: Packet,
         answer_destinations: bool,
         outbound: &mpsc::Sender<Packet>,
+        shutdown: &mut watch::Receiver<bool>,
     ) {
         match packet.header() {
             DESTINATION_REQUEST_HEADER => {
@@ -621,12 +650,12 @@ impl EngineState {
                 } else {
                     create_destination(&request, &mut self.destinations, &self.events_tx).await
                 };
-                let _ = outbound
-                    .send(Packet::new(
-                        DESTINATION_RESPONSE_HEADER,
-                        response.encode_to_vec(),
-                    ))
-                    .await;
+                let _ = send_or_shutdown(
+                    outbound,
+                    Packet::new(DESTINATION_RESPONSE_HEADER, response.encode_to_vec()),
+                    shutdown,
+                )
+                .await;
             }
             DESTINATION_RESPONSE_HEADER => {
                 let Ok(response) =
@@ -644,7 +673,11 @@ impl EngineState {
                     Some(socketid) => {
                         let socket_id = socketid as u32;
                         let conn = spawn_conn(conn_id, stream, self.events_tx.clone());
-                        self.source_sockets.insert(socket_id, conn);
+                        if let Some(old) = self.source_sockets.insert(socket_id, conn) {
+                            // A peer that reuses a socket id must not leak
+                            // the old connection's read task and fd.
+                            old.teardown();
+                        }
                         self.source_conn_ids.insert(conn_id, socket_id);
                     }
                     None => {
@@ -663,44 +696,59 @@ impl EngineState {
                 };
                 let closed = pwd.closed.unwrap_or(false) || pwd.error.is_some();
                 let sourcetodestination = pwd.sourcetodestination.unwrap_or(false);
-                let (table, mirror_flag) = if sourcetodestination {
+                let table = if sourcetodestination {
                     // Peer's source data → our destination connection.
-                    (&mut self.destinations, true)
+                    &mut self.destinations
                 } else {
                     // Peer's destination data → our source connection.
-                    (&mut self.source_sockets, false)
+                    &mut self.source_sockets
                 };
-                match table.remove(&socket_id) {
-                    Some(conn) => {
-                        if closed {
-                            conn.teardown();
-                        } else if let Some(bytes) = pwd.buffer {
-                            if conn.write_tx.send(bytes).await.is_ok() {
-                                // keep the connection registered
-                                table.insert(socket_id, conn);
-                            } else {
-                                // The local write half is gone (the writer
-                                // task died on a failed write): tear the
-                                // tunnel down and mirror the close so the
-                                // peer stops pumping into a dead socket.
-                                conn.teardown();
-                                let _ = outbound.send(closed_packet(socket_id, mirror_flag)).await;
-                            }
-                        } else {
+                // Unknown sockets were already filtered out: `remove`
+                // returning None means the frame is dropped without a
+                // reply, like upstream — a mirrored close could ping-pong
+                // between two engines that both lost the socket.
+                if let Some(conn) = table.remove(&socket_id) {
+                    if closed {
+                        conn.teardown();
+                    } else if let Some(bytes) = pwd.buffer {
+                        let sent = tokio::select! {
+                            r = conn.write_tx.send(bytes) => r.is_ok(),
+                            _ = shutdown.changed() => false,
+                        };
+                        if sent {
+                            // keep the connection registered
                             table.insert(socket_id, conn);
+                        } else {
+                            // The local write half is gone (the writer
+                            // task died on a failed write), or the
+                            // engine is shutting down: tear the tunnel
+                            // down. The peer learns of the death the
+                            // usual way — frames for this socket are
+                            // now dropped as unknown, like upstream's
+                            // "socket id that has already closed" path.
+                            conn.teardown();
                         }
-                    }
-                    None => {
-                        if closed {
-                            // Mirror the close back so the peer stops
-                            // pumping even if our side already died.
-                            let _ = outbound.send(closed_packet(socket_id, mirror_flag)).await;
-                        }
+                    } else {
+                        table.insert(socket_id, conn);
                     }
                 }
             }
             _ => {}
         }
+    }
+}
+
+/// Sends `packet` toward the session, abandoned early if the engine shuts
+/// down: a stalled session pump must not delay shutdown. Returns false
+/// when the frame was dropped.
+async fn send_or_shutdown(
+    outbound: &mpsc::Sender<Packet>,
+    packet: Packet,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        r = outbound.send(packet) => r.is_ok(),
+        _ = shutdown.changed() => false,
     }
 }
 
@@ -721,7 +769,7 @@ async fn run(mut state: EngineState, answer_destinations: bool, chans: EngineCha
         outbound,
         mut events,
         shutdown_tx,
-        shutdown_rx,
+        mut shutdown_rx,
     } = chans;
 
     loop {
@@ -747,17 +795,24 @@ async fn run(mut state: EngineState, answer_destinations: bool, chans: EngineCha
             },
             packet = inbound.recv() => match packet {
                 Some(packet) => {
-                    state.handle_peer_packet(packet, answer_destinations, &outbound).await
+                    state
+                        .handle_peer_packet(
+                            packet,
+                            answer_destinations,
+                            &outbound,
+                            &mut shutdown_rx,
+                        )
+                        .await
                 }
                 None => break,
             },
             event = events.recv() => match event {
                 Some(event) => match event {
                     Event::Accepted { source_idx, stream } => {
-                        state.handle_accepted(source_idx, stream, &outbound).await
+                        state.handle_accepted(source_idx, stream, &outbound, &mut shutdown_rx).await
                     }
                     Event::Read { conn_id, result } => {
-                        state.handle_read(conn_id, result, &outbound).await
+                        state.handle_read(conn_id, result, &outbound, &mut shutdown_rx).await
                     }
                 },
                 None => break,
@@ -1257,19 +1312,68 @@ mod tests {
         );
     }
 
-    /// A close for a socket we no longer track is mirrored back so the peer
-    /// stops pumping, keeping the engine's direction flags.
+    /// Frames for a socket we do not track are dropped silently — the
+    /// upstream `PortForwardHandler::handlePacket` logs "socket id that
+    /// has already closed" and moves on. Nothing may be mirrored back:
+    /// an echoed close can ping-pong between two engines that both lost
+    /// the socket, and it never reaches whichever side still tracks it.
     #[tokio::test]
-    async fn closes_for_unknown_sockets_are_mirrored_back() {
+    async fn closes_for_unknown_sockets_are_dropped() {
         let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
-        for (their_flag, ours) in [(true, true), (false, false)] {
-            handle.send(pf_frame(999, their_flag, b"", true));
-            let mirrored =
-                PortForwardData::decode_from_slice(next_outbound(&mut outbound).await.payload())
-                    .unwrap();
-            assert_eq!(mirrored.socketid, Some(999));
-            assert_eq!(mirrored.sourcetodestination, Some(ours));
-            assert_eq!(mirrored.closed, Some(true));
+        for flag in [true, false] {
+            handle.send(pf_frame(999, flag, b"", true));
+            handle.send(pf_frame(999, flag, b"data", false));
         }
+        assert!(
+            timeout(Duration::from_millis(300), outbound.recv())
+                .await
+                .is_err(),
+            "frames for unknown sockets must not produce outbound frames"
+        );
+    }
+
+    /// Shutdown stays responsive while the engine is blocked feeding a
+    /// stalled local connection: the destination never reads, the write
+    /// queue fills, and the engine sits in the data path — shutdown must
+    /// still complete and close the outbound channel.
+    #[tokio::test]
+    async fn shutdown_works_while_a_connection_queue_is_congested() {
+        // Accept once, never read: the writer task wedges in write_all.
+        let service = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let service_port = service.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_sock, _) = service.accept().await.unwrap();
+            // Hold the socket open without reading, forever.
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+        handle.send(destination_request(1, service_port));
+        let response = PortForwardDestinationResponse::decode_from_slice(
+            next_outbound(&mut outbound).await.payload(),
+        )
+        .unwrap();
+        let socket_id = response.socketid.expect("the destination opened");
+
+        // 1024 × 16 KiB = 16 MiB: past kernel buffers and the 256-frame
+        // queue, so the engine is blocked inside the data path.
+        for _ in 0..1024 {
+            handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        timeout(Duration::from_secs(2), handle.shutdown())
+            .await
+            .expect("shutdown must not hang while the engine is congested");
+        let drained = timeout(Duration::from_secs(2), async {
+            while outbound.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "the outbound channel must close after shutdown during congestion"
+        );
     }
 }

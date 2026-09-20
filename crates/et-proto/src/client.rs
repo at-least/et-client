@@ -194,13 +194,13 @@ impl EtClient {
         let sup_backed = backed.clone();
         tokio::spawn(async move {
             loop {
+                // `biased` + `closed` first: once the owner drops the
+                // client, the notice wins over any pending event or
+                // reconnect deterministically.
                 let event = tokio::select! {
-                    event = backed_events.recv() => event,
-                    // The owner dropped the client: return so the last
-                    // handle clone drops and the backed actor's command
-                    // channel closes — without keepalive traffic or a
-                    // tick, nothing else would carry the notice.
+                    biased;
                     _ = events_tx.closed() => return,
+                    event = backed_events.recv() => event,
                 };
                 match event {
                     Some(BackedEvent::Packet(packet)) => {
@@ -209,7 +209,16 @@ impl EtClient {
                         }
                     }
                     Some(BackedEvent::SocketDown) => loop {
-                        match handshake_request(&sup_endpoint, &sup_id).await {
+                        let outcome = tokio::select! {
+                            biased;
+                            // The owner dropped the client mid-reconnect:
+                            // stop attempting and return so the last
+                            // handle clone drops and the backed actor
+                            // shuts down.
+                            _ = events_tx.closed() => return,
+                            outcome = handshake_request(&sup_endpoint, &sup_id) => outcome,
+                        };
+                        match outcome {
                             Ok(Handshake::Returning(stream)) => {
                                 if sup_backed.recover(stream).await {
                                     break;
@@ -446,6 +455,44 @@ mod tests {
         let read = timeout(Duration::from_secs(2), peer.read_exact(&mut eof)).await;
         let read = read.expect("the socket must close within 2s of dropping the client");
         assert!(read.is_err(), "expected EOF after the drop, got {read:?}");
+    }
+
+    /// A client dropped while its supervisor sits mid-reconnect (inside a
+    /// handshake attempt) must abandon the attempt: the in-flight
+    /// handshake socket closes instead of hanging for the full handshake
+    /// timeout, and the supervisor stops.
+    #[tokio::test]
+    async fn dropping_the_client_abandons_an_in_flight_reconnect() {
+        let rig = server_rig().await;
+        let rx = spawn_handshake(&rig, ConnectStatus::NewClient);
+        let client = EtClient::connect_with(rig.addr.to_string(), ID.into(), PASSKEY, None)
+            .await
+            .unwrap();
+        let peer1 = rx.await.unwrap();
+        drop(peer1); // SocketDown → the supervisor enters the reconnect loop.
+
+        // The supervisor's first reconnect attempt arrives and sends its
+        // ConnectRequest: it is now parked mid-handshake.
+        let (mut peer2, _) = timeout(LONG, rig.listener.accept()).await.unwrap().unwrap();
+        let bytes = timeout(
+            LONG,
+            read_proto_frame(&mut peer2, MAX_HANDSHAKE_PROTO_LENGTH),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(ConnectRequest::decode_from_slice(&bytes).is_ok());
+
+        drop(client);
+
+        // The in-flight handshake must be abandoned promptly.
+        let mut eof = [0u8; 1];
+        let read = timeout(Duration::from_secs(2), peer2.read_exact(&mut eof)).await;
+        let read = read.expect("the handshake socket must close within 2s of the drop");
+        assert!(
+            read.is_err(),
+            "expected EOF on the abandoned handshake, got {read:?}"
+        );
     }
 
     /// Reconnect answered `NEW_CLIENT`: the server kept the key but lost

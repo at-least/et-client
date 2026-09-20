@@ -49,6 +49,11 @@ pub const DISCONNECT_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
 /// at 30 s idle / 60 s absolute; a shorter ceiling bounds how long a bogus
 /// reconnect (anyone who knows the id can trigger one) stalls the victim's
 /// writes, which upstream blocks for the full window.
+///
+/// Known trade-off: on a link too slow to push a large missed backlog
+/// within this window, recovery times out and retries (writes keep
+/// buffering, bounded by `DISCONNECT_BUFFER_BYTES`) until the link
+/// improves — bounded self-healing rather than an unbounded stall.
 pub const RECOVER_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_QUEUE_DEPTH: usize = 1024;
 const EVENT_QUEUE_DEPTH: usize = 1024;
