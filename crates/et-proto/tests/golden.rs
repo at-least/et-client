@@ -39,28 +39,43 @@ fn connect_response_golden() {
         error: Some("boom".into()),
         ..Default::default()
     };
-    assert_eq!(err.encode_to_vec(), vec![0x08, 0x04, 0x12, 0x04, b'b', b'o', b'o', b'm']);
+    assert_eq!(
+        err.encode_to_vec(),
+        vec![0x08, 0x04, 0x12, 0x04, b'b', b'o', b'o', b'm']
+    );
 }
 
 #[test]
 fn sequence_header_and_catchup_golden() {
-    let sh = SequenceHeader { sequenceNumber: Some(5), ..Default::default() };
+    let sh = SequenceHeader {
+        sequenceNumber: Some(5),
+        ..Default::default()
+    };
     assert_eq!(sh.encode_to_vec(), vec![0x08, 0x05]);
 
     let cb = CatchupBuffer {
         buffer: vec![b"a".to_vec(), vec![0x01, 0x02]],
         ..Default::default()
     };
-    assert_eq!(cb.encode_to_vec(), vec![0x0A, 0x01, b'a', 0x0A, 0x02, 0x01, 0x02]);
+    assert_eq!(
+        cb.encode_to_vec(),
+        vec![0x0A, 0x01, b'a', 0x0A, 0x02, 0x01, 0x02]
+    );
 }
 
 #[test]
 fn proto2_default_presence_is_serialized() {
     // Some(false) must stay on the wire (proto2 explicit presence).
-    let p = InitialPayload { jumphost: Some(false), ..Default::default() };
+    let p = InitialPayload {
+        jumphost: Some(false),
+        ..Default::default()
+    };
     assert_eq!(p.encode_to_vec(), vec![0x08, 0x00]);
     // None must be absent.
-    let p = InitialPayload { jumphost: None, ..p };
+    let p = InitialPayload {
+        jumphost: None,
+        ..p
+    };
     assert_eq!(p.encode_to_vec(), Vec::<u8>::new());
 }
 
@@ -83,7 +98,10 @@ fn initial_payload_with_map_golden() {
 
 #[test]
 fn terminal_buffer_golden() {
-    let tb = TerminalBuffer { buffer: Some(b"hi".to_vec()), ..Default::default() };
+    let tb = TerminalBuffer {
+        buffer: Some(b"hi".to_vec()),
+        ..Default::default()
+    };
     assert_eq!(tb.encode_to_vec(), vec![0x0A, 0x02, b'h', b'i']);
 }
 

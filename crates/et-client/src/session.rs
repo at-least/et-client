@@ -5,19 +5,19 @@
 
 use std::time::Duration;
 
+use buffa::Message as _;
 use et_proto::forward::{
-    DESTINATION_REQUEST_HEADER, DESTINATION_RESPONSE_HEADER, EngineHandle, PORT_FORWARD_HEADER,
+    EngineHandle, DESTINATION_REQUEST_HEADER, DESTINATION_RESPONSE_HEADER, PORT_FORWARD_HEADER,
 };
+use et_proto::{et_packet_type, terminal_packet_type, Packet};
 use et_proto::{
     InitialPayload, InitialResponse, PortForwardSourceRequest, TerminalBuffer, TerminalInfo,
 };
-use et_proto::{et_packet_type, terminal_packet_type, Packet};
-use buffa::Message as _;
 use tokio::sync::mpsc;
 
+use crate::connection::ClientDeadReason;
 use crate::connection::{EtClient, Event};
 use crate::error::ConnectFailure;
-use crate::connection::ClientDeadReason;
 use et_proto::backed::WriteError;
 use et_proto::ConnectStatus;
 
@@ -108,16 +108,20 @@ impl TerminalSession {
         let mut client = loop {
             match EtClient::connect(endpoint.clone(), id.clone(), passkey, keepalive).await {
                 Ok(client) => break client,
-                Err(ConnectFailure::Rejected { status: ConnectStatus::InvalidKey, .. })
-                    if std::time::Instant::now() < deadline =>
-                {
+                Err(ConnectFailure::Rejected {
+                    status: ConnectStatus::InvalidKey,
+                    ..
+                }) if std::time::Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
                 Err(e) => return Err(e.into()),
             }
         };
         client
-            .write(et_packet_type::INITIAL_PAYLOAD, initial_payload.encode_to_vec())
+            .write(
+                et_packet_type::INITIAL_PAYLOAD,
+                initial_payload.encode_to_vec(),
+            )
             .await?;
 
         let wait = async {
@@ -157,7 +161,11 @@ impl TerminalSession {
             pf_inbound = Some(handle);
             pf_outbound = Some(outbound_rx);
         }
-        Ok(Self { client, pf_inbound, pf_outbound })
+        Ok(Self {
+            client,
+            pf_inbound,
+            pf_outbound,
+        })
     }
 
     /// Starts port forwarding. `sources` listen **locally** (forward
@@ -177,8 +185,7 @@ impl TerminalSession {
         let bind_errors = match &self.pf_inbound {
             Some(engine) => engine.add_sources(sources).await,
             None => {
-                let (inbound, outbound_rx, bind_errors) =
-                    EngineHandle::spawn(sources, true).await;
+                let (inbound, outbound_rx, bind_errors) = EngineHandle::spawn(sources, true).await;
                 self.pf_outbound = Some(outbound_rx);
                 self.pf_inbound = Some(inbound);
                 bind_errors
@@ -193,7 +200,10 @@ impl TerminalSession {
 
     /// Send raw input to the shell (`TERMINAL_BUFFER`).
     pub async fn send_input(&self, data: &[u8]) -> Result<(), WriteError> {
-        let tb = TerminalBuffer { buffer: Some(data.to_vec()), ..Default::default() };
+        let tb = TerminalBuffer {
+            buffer: Some(data.to_vec()),
+            ..Default::default()
+        };
         self.client
             .write(terminal_packet_type::TERMINAL_BUFFER, tb.encode_to_vec())
             .await
@@ -291,11 +301,13 @@ impl TerminalSession {
 mod tests {
     use super::*;
     use et_proto::crypto::CryptoHandler;
-    use et_proto::framing::{read_framed_packet, read_proto_frame, write_framed_packet, write_proto_frame};
+    use et_proto::framing::{
+        read_framed_packet, read_proto_frame, write_framed_packet, write_proto_frame,
+    };
     use et_proto::{
-        CLIENT_SERVER_NONCE_MSB, ConnectRequest, ConnectResponse, ConnectStatus,
-        MAX_HANDSHAKE_PROTO_LENGTH, MAX_PACKET_LENGTH, PortForwardDestinationRequest,
-        PROTOCOL_VERSION, SERVER_CLIENT_NONCE_MSB, SocketEndpoint,
+        ConnectRequest, ConnectResponse, ConnectStatus, PortForwardDestinationRequest,
+        SocketEndpoint, CLIENT_SERVER_NONCE_MSB, MAX_HANDSHAKE_PROTO_LENGTH, MAX_PACKET_LENGTH,
+        PROTOCOL_VERSION, SERVER_CLIENT_NONCE_MSB,
     };
     use std::sync::Arc;
     use tokio::net::TcpListener;
@@ -326,7 +338,9 @@ mod tests {
     impl Rig {
         /// Reads one encrypted packet from the client.
         async fn read_client_packet(&mut self) -> Packet {
-            let mut packet = read_framed_packet(&mut self.peer, MAX_PACKET_LENGTH).await.unwrap();
+            let mut packet = read_framed_packet(&mut self.peer, MAX_PACKET_LENGTH)
+                .await
+                .unwrap();
             assert!(packet.is_encrypted());
             packet.decrypt(&mut self.from_client).unwrap();
             packet
@@ -355,13 +369,19 @@ mod tests {
 
         let (mut peer, _) = listener.accept().await.unwrap();
         peer.set_nodelay(true).ok();
-        let bytes = read_proto_frame(&mut peer, MAX_HANDSHAKE_PROTO_LENGTH).await.unwrap();
+        let bytes = read_proto_frame(&mut peer, MAX_HANDSHAKE_PROTO_LENGTH)
+            .await
+            .unwrap();
         let request = ConnectRequest::decode_from_slice(&bytes).unwrap();
         assert_eq!(request.clientId.as_deref(), Some(ID));
         assert_eq!(request.version, Some(PROTOCOL_VERSION));
-        let response =
-            ConnectResponse { status: Some(ConnectStatus::NewClient), ..Default::default() };
-        write_proto_frame(&mut peer, &response.encode_to_vec()).await.unwrap();
+        let response = ConnectResponse {
+            status: Some(ConnectStatus::NewClient),
+            ..Default::default()
+        };
+        write_proto_frame(&mut peer, &response.encode_to_vec())
+            .await
+            .unwrap();
 
         let mut key = [0u8; 32];
         key.copy_from_slice(PASSKEY.as_bytes());
@@ -369,11 +389,16 @@ mod tests {
         let mut from_client = CryptoHandler::new(&key, CLIENT_SERVER_NONCE_MSB);
 
         timeout(LONG, async {
-            let mut packet = read_framed_packet(&mut peer, MAX_PACKET_LENGTH).await.unwrap();
+            let mut packet = read_framed_packet(&mut peer, MAX_PACKET_LENGTH)
+                .await
+                .unwrap();
             assert!(packet.is_encrypted());
             packet.decrypt(&mut from_client).unwrap();
             assert_eq!(packet.header(), et_packet_type::INITIAL_PAYLOAD);
-            let resp = InitialResponse { error: None, ..Default::default() };
+            let resp = InitialResponse {
+                error: None,
+                ..Default::default()
+            };
             let mut p = Packet::new(et_packet_type::INITIAL_RESPONSE, resp.encode_to_vec());
             p.encrypt(&mut to_client);
             write_framed_packet(&mut peer, &p).await.unwrap();
@@ -414,8 +439,10 @@ mod tests {
     /// started" (upstream supports `-t` and `-r` together).
     #[tokio::test]
     async fn forward_sources_can_be_added_to_a_reverse_tunnel_session() {
-        let payload =
-            InitialPayload { reversetunnels: vec![PortForwardSourceRequest::default()], ..Default::default() };
+        let payload = InitialPayload {
+            reversetunnels: vec![PortForwardSourceRequest::default()],
+            ..Default::default()
+        };
         let (mut session, mut rig) = start_session(&payload).await;
         let port = free_port().await;
 
@@ -426,10 +453,10 @@ mod tests {
 
         // The source is really bound: a local connection reaches the peer
         // as a DESTINATION_REQUEST once the session pump runs.
-        let _conn = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let driver = tokio::spawn(async move {
-            while session.next_event().await.is_some() {}
-        });
+        let _conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let driver = tokio::spawn(async move { while session.next_event().await.is_some() {} });
         let request = timeout(LONG, async {
             loop {
                 let packet = rig.read_client_packet().await;
@@ -451,7 +478,10 @@ mod tests {
     async fn shutdown_releases_the_port_forward_listener() {
         let (mut session, _rig) = start_session(&InitialPayload::default()).await;
         let port = free_port().await;
-        session.start_port_forwarding(vec![source_request(port)]).await.unwrap();
+        session
+            .start_port_forwarding(vec![source_request(port)])
+            .await
+            .unwrap();
 
         session.shutdown().await;
 
@@ -459,7 +489,11 @@ mod tests {
         // re-binding a live port, so acceptance is the observable).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            match timeout_at(deadline, tokio::net::TcpStream::connect(("127.0.0.1", port))).await
+            match timeout_at(
+                deadline,
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
             {
                 Err(_) => panic!("the PF listener must stop accepting after shutdown()"),
                 Ok(Ok(_conn)) => continue, // still up; recheck until the deadline

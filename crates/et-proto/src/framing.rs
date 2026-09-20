@@ -173,7 +173,9 @@ pub fn try_parse_packet_frame_from_buffer(
     match try_parse_proto_frame(buf) {
         None => None,
         Some(Err(e)) => Some(Err(e)),
-        Some(Ok(bytes)) => Some(crate::packet::Packet::parse(&bytes).ok_or(FrameError::InvalidPacket)),
+        Some(Ok(bytes)) => {
+            Some(crate::packet::Packet::parse(&bytes).ok_or(FrameError::InvalidPacket))
+        }
     }
 }
 
@@ -191,7 +193,9 @@ mod tests {
             version: Some(crate::PROTOCOL_VERSION),
             ..Default::default()
         };
-        write_proto_frame(&mut buf, &req.encode_to_vec()).await.unwrap();
+        write_proto_frame(&mut buf, &req.encode_to_vec())
+            .await
+            .unwrap();
         let decoded = read_proto_frame(&mut &buf[..], crate::MAX_HANDSHAKE_PROTO_LENGTH)
             .await
             .unwrap();
@@ -242,20 +246,32 @@ mod tests {
         write_framed_packet(&mut buf, &p).await.unwrap();
         // u32 BE length prefix, then [0, header].
         assert_eq!(&buf[..6], &[0, 0, 0, 2, 0, 0]);
-        assert_eq!(read_framed_packet(&mut &buf[..], crate::MAX_PACKET_LENGTH).await.unwrap(), p);
+        assert_eq!(
+            read_framed_packet(&mut &buf[..], crate::MAX_PACKET_LENGTH)
+                .await
+                .unwrap(),
+            p
+        );
     }
 
     #[tokio::test]
     async fn unix_packet_frame_and_typed_proto() {
         let mut buf = Vec::new();
-        let p = Packet::new(crate::terminal_packet_type::TERMINAL_USER_INFO, b"x".to_vec());
+        let p = Packet::new(
+            crate::terminal_packet_type::TERMINAL_USER_INFO,
+            b"x".to_vec(),
+        );
         write_packet_frame(&mut buf, &p).await.unwrap();
         assert_eq!(read_packet_frame(&mut &buf[..], 1024).await.unwrap(), p);
 
         let mut buf = Vec::new();
-        write_typed_proto(&mut buf, crate::terminal_packet_type::TERMINAL_BUFFER, b"hi")
-            .await
-            .unwrap();
+        write_typed_proto(
+            &mut buf,
+            crate::terminal_packet_type::TERMINAL_BUFFER,
+            b"hi",
+        )
+        .await
+        .unwrap();
         assert_eq!(buf[0], crate::terminal_packet_type::TERMINAL_BUFFER);
         let proto = read_proto_frame(&mut &buf[1..], 1024).await.unwrap();
         assert_eq!(proto, b"hi");

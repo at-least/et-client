@@ -62,7 +62,10 @@ mod tests {
             assert_eq!(id.len(), ID_LEN);
             assert_eq!(&id[..3], "XXX");
             assert_eq!(passkey.len(), PASSKEY_LEN);
-            assert!(id.bytes().chain(passkey.bytes()).all(|b| ALPHANUM.contains(&b)));
+            assert!(id
+                .bytes()
+                .chain(passkey.bytes())
+                .all(|b| ALPHANUM.contains(&b)));
         }
     }
 

@@ -94,10 +94,16 @@ async fn start_cpp_stack() -> CppStack {
     // Wait for the TCP listener.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "C++ etserver never listened");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "C++ etserver never listened"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -127,7 +133,14 @@ async fn start_cpp_stack() -> CppStack {
     let mut stdout = terminal.stdout.take().unwrap();
     let (id, passkey) = scrape_idpasskey(&mut stdout).await;
 
-    CppStack { port, id, passkey, server, terminal, dir }
+    CppStack {
+        port,
+        id,
+        passkey,
+        server,
+        terminal,
+        dir,
+    }
 }
 
 /// Reads the `IDPASSKEY:<16>/<32>` line from an etterminal stdout,
@@ -139,7 +152,10 @@ async fn scrape_idpasskey(stdout: &mut tokio::process::ChildStdout) -> (String, 
     let mut buf = [0u8; 256];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "no IDPASSKEY from C++ etterminal");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no IDPASSKEY from C++ etterminal"
+        );
         let n = match tokio::time::timeout(Duration::from_millis(500), stdout.read(&mut buf)).await
         {
             Ok(read) => read.expect("read etterminal stdout"),
@@ -181,7 +197,10 @@ async fn rust_client_talks_to_cpp_server() {
     let mut out: Vec<u8> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while !String::from_utf8_lossy(&out).contains("RS_CPP_42") {
-        assert!(tokio::time::Instant::now() < deadline, "no RS_CPP_42; got {out:?}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no RS_CPP_42; got {out:?}"
+        );
         match tokio::time::timeout(Duration::from_millis(300), session.next_event()).await {
             Ok(Some(SessionEvent::TerminalBuffer(bytes))) => out.extend_from_slice(&bytes),
             Ok(Some(_)) => {}
@@ -195,7 +214,10 @@ async fn rust_client_talks_to_cpp_server() {
     // nonce continuity across sockets, and the CatchupBuffer framing.
     session.send_input(b"seq 1 5000\n").await.unwrap();
     session.kill_socket().await;
-    session.send_input(b"echo AFTER_CPP_$((40+2))\n").await.unwrap();
+    session
+        .send_input(b"echo AFTER_CPP_$((40+2))\n")
+        .await
+        .unwrap();
 
     use std::collections::BTreeSet;
     let mut seen: BTreeSet<u32> = BTreeSet::new();
@@ -221,7 +243,11 @@ async fn rust_client_talks_to_cpp_server() {
             Err(_) => {}
         }
     }
-    assert!(marker, "post-disconnect input lost; {} lines recovered", seen.len());
+    assert!(
+        marker,
+        "post-disconnect input lost; {} lines recovered",
+        seen.len()
+    );
     if seen.len() != 5000 {
         let missing: Vec<u32> = (1..=5000).filter(|n| !seen.contains(n)).collect();
         panic!(
@@ -236,7 +262,10 @@ async fn rust_client_talks_to_cpp_server() {
     session.send_input(b"exit\n").await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "session never ended");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session never ended"
+        );
         match tokio::time::timeout(Duration::from_secs(2), session.next_event()).await {
             Ok(Some(SessionEvent::Dead(_))) => break,
             Ok(Some(_)) => {}
@@ -249,11 +278,15 @@ async fn rust_client_talks_to_cpp_server() {
 
 /// ECHO server on an ephemeral port; returns the port.
 async fn spawn_echo_listener() -> u16 {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
                 loop {
@@ -426,10 +459,16 @@ async fn jumphost_chain_through_cpp_servers() {
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", jump_port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", jump_port))
+            .await
+            .is_ok()
+        {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "C++ jump etserver never listened");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "C++ jump etserver never listened"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -469,7 +508,10 @@ async fn jumphost_chain_through_cpp_servers() {
         "jump registration diverged from the destination credentials"
     );
 
-    let payload = InitialPayload { jumphost: Some(true), ..Default::default() };
+    let payload = InitialPayload {
+        jumphost: Some(true),
+        ..Default::default()
+    };
     let mut session = TerminalSession::start(
         format!("127.0.0.1:{jump_port}"),
         dest.id.clone(),
@@ -485,7 +527,10 @@ async fn jumphost_chain_through_cpp_servers() {
     let mut out: Vec<u8> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while !String::from_utf8_lossy(&out).contains("JCPP_32") {
-        assert!(tokio::time::Instant::now() < deadline, "no JCPP_32; got {out:?}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no JCPP_32; got {out:?}"
+        );
         match tokio::time::timeout(Duration::from_millis(300), session.next_event()).await {
             Ok(Some(SessionEvent::TerminalBuffer(bytes))) => out.extend_from_slice(&bytes),
             Ok(Some(_)) => {}

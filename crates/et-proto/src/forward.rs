@@ -30,7 +30,8 @@ use crate::{
 };
 
 pub use crate::terminal_packet_type::{
-    PORT_FORWARD_DATA as PORT_FORWARD_HEADER, PORT_FORWARD_DESTINATION_REQUEST as DESTINATION_REQUEST_HEADER,
+    PORT_FORWARD_DATA as PORT_FORWARD_HEADER,
+    PORT_FORWARD_DESTINATION_REQUEST as DESTINATION_REQUEST_HEADER,
     PORT_FORWARD_DESTINATION_RESPONSE as DESTINATION_RESPONSE_HEADER,
 };
 
@@ -97,7 +98,11 @@ pub fn parse_ranges(input: &str) -> Result<Vec<PortForwardSourceRequest>, Tunnel
 }
 
 fn endpoint(name: Option<&str>, port: Option<i32>) -> crate::SocketEndpoint {
-    crate::SocketEndpoint { name: name.map(str::to_string), port, ..Default::default() }
+    crate::SocketEndpoint {
+        name: name.map(str::to_string),
+        port,
+        ..Default::default()
+    }
 }
 
 fn process_et_style(
@@ -129,8 +134,14 @@ fn process_et_style(
         if src_range.len() != 2 || dst_range.len() != 2 {
             return Err(TunnelParseError::Invalid(input.into(), "bad range".into()));
         }
-        let (src_start, src_end) = (parse_port(src_range[0], input)?, parse_port(src_range[1], input)?);
-        let (dst_start, dst_end) = (parse_port(dst_range[0], input)?, parse_port(dst_range[1], input)?);
+        let (src_start, src_end) = (
+            parse_port(src_range[0], input)?,
+            parse_port(src_range[1], input)?,
+        );
+        let (dst_start, dst_end) = (
+            parse_port(dst_range[0], input)?,
+            parse_port(dst_range[1], input)?,
+        );
         if src_end - src_start != dst_end - dst_start {
             return Err(TunnelParseError::RangeLengthMismatch);
         }
@@ -155,8 +166,9 @@ fn process_et_style(
 }
 
 fn parse_port(v: &str, input: &str) -> Result<i32, TunnelParseError> {
-    let port: i64 =
-        v.parse().map_err(|_| TunnelParseError::Invalid(input.into(), "bad port".into()))?;
+    let port: i64 = v
+        .parse()
+        .map_err(|_| TunnelParseError::Invalid(input.into(), "bad port".into()))?;
     if !(0..=65535).contains(&port) {
         return Err(TunnelParseError::PortOutOfRange(port));
     }
@@ -223,7 +235,10 @@ pub struct EngineHandle {
 enum Cmd {
     /// Bind more sources into the running engine; reply carries the bind
     /// errors (one per failed bind, like [`EngineHandle::spawn`]).
-    AddSources { sources: Vec<PortForwardSourceRequest>, reply: oneshot::Sender<Vec<String>> },
+    AddSources {
+        sources: Vec<PortForwardSourceRequest>,
+        reply: oneshot::Sender<Vec<String>>,
+    },
     /// Stop the engine.
     Shutdown,
 }
@@ -253,7 +268,14 @@ impl EngineHandle {
         tokio::spawn(run(
             state,
             answer_destinations,
-            EngineChannels { inbound: inbound_rx, cmd_rx, outbound, events, shutdown_tx, shutdown_rx },
+            EngineChannels {
+                inbound: inbound_rx,
+                cmd_rx,
+                outbound,
+                events,
+                shutdown_tx,
+                shutdown_rx,
+            },
         ));
         (EngineHandle { inbound, cmd_tx }, outbound_rx, bind_errors)
     }
@@ -275,7 +297,12 @@ impl EngineHandle {
     /// Returns one message per failed bind, like [`EngineHandle::spawn`].
     pub async fn add_sources(&self, sources: Vec<PortForwardSourceRequest>) -> Vec<String> {
         let (reply, reply_rx) = oneshot::channel();
-        if self.cmd_tx.send(Cmd::AddSources { sources, reply }).await.is_err() {
+        if self
+            .cmd_tx
+            .send(Cmd::AddSources { sources, reply })
+            .await
+            .is_err()
+        {
             return Vec::new();
         }
         reply_rx.await.unwrap_or_default()
@@ -345,10 +372,16 @@ fn spawn_accept_task(
 #[derive(Debug)]
 enum Event {
     /// A connection accepted by one of our source listeners.
-    Accepted { source_idx: usize, stream: TcpStream },
+    Accepted {
+        source_idx: usize,
+        stream: TcpStream,
+    },
     /// Bytes (or EOF/error) read from a local connection. Destination-role
     /// connections use their random socket id as `conn_id`.
-    Read { conn_id: u32, result: std::io::Result<Vec<u8>> },
+    Read {
+        conn_id: u32,
+        result: std::io::Result<Vec<u8>>,
+    },
 }
 
 /// A local TCP connection: one task writing peer data, one reading.
@@ -364,23 +397,39 @@ fn spawn_conn(conn_id: u32, stream: TcpStream, events: mpsc::Sender<Event>) -> C
     let dup = || -> std::io::Result<(TcpStream, TcpStream)> {
         let std_stream = stream.into_std()?;
         let clone = std_stream.try_clone()?;
-        Ok((TcpStream::from_std(std_stream)?, TcpStream::from_std(clone)?))
+        Ok((
+            TcpStream::from_std(std_stream)?,
+            TcpStream::from_std(clone)?,
+        ))
     };
     let (mut read_stream, mut write_stream) = match dup() {
         Ok(pair) => pair,
-        Err(_) => return Conn { write_tx, read_abort: dead_abort() },
+        Err(_) => {
+            return Conn {
+                write_tx,
+                read_abort: dead_abort(),
+            }
+        }
     };
     let read_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             match read_stream.read(&mut buf).await {
                 Ok(0) => {
-                    let _ = events.send(Event::Read { conn_id, result: Ok(Vec::new()) }).await;
+                    let _ = events
+                        .send(Event::Read {
+                            conn_id,
+                            result: Ok(Vec::new()),
+                        })
+                        .await;
                     return;
                 }
                 Ok(n) => {
                     if events
-                        .send(Event::Read { conn_id, result: Ok(buf[..n].to_vec()) })
+                        .send(Event::Read {
+                            conn_id,
+                            result: Ok(buf[..n].to_vec()),
+                        })
                         .await
                         .is_err()
                     {
@@ -388,7 +437,12 @@ fn spawn_conn(conn_id: u32, stream: TcpStream, events: mpsc::Sender<Event>) -> C
                     }
                 }
                 Err(e) => {
-                    let _ = events.send(Event::Read { conn_id, result: Err(e) }).await;
+                    let _ = events
+                        .send(Event::Read {
+                            conn_id,
+                            result: Err(e),
+                        })
+                        .await;
                     return;
                 }
             }
@@ -405,7 +459,10 @@ fn spawn_conn(conn_id: u32, stream: TcpStream, events: mpsc::Sender<Event>) -> C
             }
         }
     });
-    Conn { write_tx, read_abort }
+    Conn {
+        write_tx,
+        read_abort,
+    }
 }
 
 fn dead_abort() -> tokio::task::AbortHandle {
@@ -458,9 +515,16 @@ impl EngineState {
         // `pending` holds bare streams: dropping closes them.
     }
 
-    async fn handle_accepted(&mut self, source_idx: usize, stream: TcpStream, outbound: &mpsc::Sender<Packet>) {
-        let Some(destination) =
-            self.sources.get(source_idx).and_then(|pfsr| pfsr.destination.as_option().cloned())
+    async fn handle_accepted(
+        &mut self,
+        source_idx: usize,
+        stream: TcpStream,
+        outbound: &mpsc::Sender<Packet>,
+    ) {
+        let Some(destination) = self
+            .sources
+            .get(source_idx)
+            .and_then(|pfsr| pfsr.destination.as_option().cloned())
         else {
             return;
         };
@@ -473,11 +537,19 @@ impl EngineState {
             ..Default::default()
         };
         let _ = outbound
-            .send(Packet::new(DESTINATION_REQUEST_HEADER, request.encode_to_vec()))
+            .send(Packet::new(
+                DESTINATION_REQUEST_HEADER,
+                request.encode_to_vec(),
+            ))
             .await;
     }
 
-    async fn handle_read(&mut self, conn_id: u32, result: std::io::Result<Vec<u8>>, outbound: &mpsc::Sender<Packet>) {
+    async fn handle_read(
+        &mut self,
+        conn_id: u32,
+        result: std::io::Result<Vec<u8>>,
+        outbound: &mpsc::Sender<Packet>,
+    ) {
         if let Some(&socket_id) = self.source_conn_ids.get(&conn_id) {
             // Source role: local reads → peer destination.
             match result {
@@ -542,8 +614,7 @@ impl EngineState {
                     PortForwardDestinationResponse {
                         clientfd: request.fd,
                         error: Some(
-                            "port forwarding destinations are not enabled on this session"
-                                .into(),
+                            "port forwarding destinations are not enabled on this session".into(),
                         ),
                         ..Default::default()
                     }
@@ -551,7 +622,10 @@ impl EngineState {
                     create_destination(&request, &mut self.destinations, &self.events_tx).await
                 };
                 let _ = outbound
-                    .send(Packet::new(DESTINATION_RESPONSE_HEADER, response.encode_to_vec()))
+                    .send(Packet::new(
+                        DESTINATION_RESPONSE_HEADER,
+                        response.encode_to_vec(),
+                    ))
                     .await;
             }
             DESTINATION_RESPONSE_HEADER => {
@@ -560,8 +634,12 @@ impl EngineState {
                 else {
                     return;
                 };
-                let Some(conn_id) = response.clientfd.map(|v| v as u32) else { return };
-                let Some(stream) = self.pending.remove(&conn_id) else { return };
+                let Some(conn_id) = response.clientfd.map(|v| v as u32) else {
+                    return;
+                };
+                let Some(stream) = self.pending.remove(&conn_id) else {
+                    return;
+                };
                 match response.socketid {
                     Some(socketid) => {
                         let socket_id = socketid as u32;
@@ -580,7 +658,9 @@ impl EngineState {
                 let Ok(pwd) = PortForwardData::decode_from_slice(packet.payload()) else {
                     return;
                 };
-                let Some(socket_id) = pwd.socketid.map(|v| v as u32) else { return };
+                let Some(socket_id) = pwd.socketid.map(|v| v as u32) else {
+                    return;
+                };
                 let closed = pwd.closed.unwrap_or(false) || pwd.error.is_some();
                 let sourcetodestination = pwd.sourcetodestination.unwrap_or(false);
                 let (table, mirror_flag) = if sourcetodestination {
@@ -604,8 +684,7 @@ impl EngineState {
                                 // tunnel down and mirror the close so the
                                 // peer stops pumping into a dead socket.
                                 conn.teardown();
-                                let _ =
-                                    outbound.send(closed_packet(socket_id, mirror_flag)).await;
+                                let _ = outbound.send(closed_packet(socket_id, mirror_flag)).await;
                             }
                         } else {
                             table.insert(socket_id, conn);
@@ -635,11 +714,7 @@ struct EngineChannels {
     shutdown_rx: watch::Receiver<bool>,
 }
 
-async fn run(
-    mut state: EngineState,
-    answer_destinations: bool,
-    chans: EngineChannels,
-) {
+async fn run(mut state: EngineState, answer_destinations: bool, chans: EngineChannels) {
     let EngineChannels {
         mut inbound,
         mut cmd_rx,
@@ -712,7 +787,9 @@ async fn create_destination(
     let Ok(port) = u16::try_from(port) else {
         return PortForwardDestinationResponse {
             clientfd: request.fd,
-            error: Some(format!("destination port {port} is out of range (must be 0-65535)")),
+            error: Some(format!(
+                "destination port {port} is out of range (must be 0-65535)"
+            )),
             ..Default::default()
         };
     };
@@ -842,8 +919,14 @@ mod tests {
             parse_ranges("18000-18002:8000-8001"),
             Err(TunnelParseError::RangeLengthMismatch)
         ));
-        assert!(matches!(parse_ranges("18000-18002:8000"), Err(TunnelParseError::HalfRange)));
-        assert!(matches!(parse_ranges("18000"), Err(TunnelParseError::MissingDestination)));
+        assert!(matches!(
+            parse_ranges("18000-18002:8000"),
+            Err(TunnelParseError::HalfRange)
+        ));
+        assert!(matches!(
+            parse_ranges("18000"),
+            Err(TunnelParseError::MissingDestination)
+        ));
     }
 
     #[test]
@@ -952,7 +1035,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     loop {
@@ -977,7 +1062,10 @@ mod tests {
         let port = taken.local_addr().unwrap().port();
         let (_, _, errors) = EngineHandle::spawn(vec![source_request(port)], false).await;
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains(&format!("127.0.0.1:{port}")), "{errors:?}");
+        assert!(
+            errors[0].contains(&format!("127.0.0.1:{port}")),
+            "{errors:?}"
+        );
     }
 
     /// Dropping every handle is a shutdown: the engine task ends, the
@@ -998,11 +1086,20 @@ mod tests {
             while outbound.recv().await.is_some() {}
         })
         .await;
-        assert!(drained.is_ok(), "the outbound channel must close when the engine stops");
+        assert!(
+            drained.is_ok(),
+            "the outbound channel must close when the engine stops"
+        );
 
-        let rebound =
-            timeout(Duration::from_secs(2), TcpListener::bind(("127.0.0.1", port))).await;
-        assert!(rebound.is_ok(), "the listener must be released after the engine stops");
+        let rebound = timeout(
+            Duration::from_secs(2),
+            TcpListener::bind(("127.0.0.1", port)),
+        )
+        .await;
+        assert!(
+            rebound.is_ok(),
+            "the listener must be released after the engine stops"
+        );
     }
 
     /// Explicit `shutdown()` stops the engine even while a handle is held.
@@ -1021,11 +1118,20 @@ mod tests {
             while outbound.recv().await.is_some() {}
         })
         .await;
-        assert!(drained.is_ok(), "the outbound channel must close after shutdown()");
+        assert!(
+            drained.is_ok(),
+            "the outbound channel must close after shutdown()"
+        );
 
-        let rebound =
-            timeout(Duration::from_secs(2), TcpListener::bind(("127.0.0.1", port))).await;
-        assert!(rebound.is_ok(), "the listener must be released after shutdown()");
+        let rebound = timeout(
+            Duration::from_secs(2),
+            TcpListener::bind(("127.0.0.1", port)),
+        )
+        .await;
+        assert!(
+            rebound.is_ok(),
+            "the listener must be released after shutdown()"
+        );
     }
 
     /// Sources can be bound into an already-running engine: the session
@@ -1046,7 +1152,11 @@ mod tests {
         let packet = next_outbound(&mut outbound).await;
         assert_eq!(packet.header(), DESTINATION_REQUEST_HEADER);
         let request = PortForwardDestinationRequest::decode_from_slice(packet.payload()).unwrap();
-        assert_eq!(request.fd, Some(1), "the first accepted conn gets conn id 1");
+        assert_eq!(
+            request.fd,
+            Some(1),
+            "the first accepted conn gets conn id 1"
+        );
 
         // Bind failures are reported like at spawn time.
         let taken = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1124,11 +1234,14 @@ mod tests {
         let socket_id = response.socketid.expect("the destination opened");
 
         handle.send(pf_frame(socket_id, true, b"ping", false));
-        let back =
-            PortForwardData::decode_from_slice(next_outbound(&mut outbound).await.payload())
-                .unwrap();
+        let back = PortForwardData::decode_from_slice(next_outbound(&mut outbound).await.payload())
+            .unwrap();
         assert_eq!(back.socketid, Some(socket_id));
-        assert_eq!(back.sourcetodestination, Some(false), "the echo flows destination→source");
+        assert_eq!(
+            back.sourcetodestination,
+            Some(false),
+            "the echo flows destination→source"
+        );
         assert_eq!(back.buffer.as_deref(), Some(&b"ping"[..]));
 
         // The peer's close tears the tunnel down locally — no close frame is
@@ -1137,7 +1250,9 @@ mod tests {
         handle.send(pf_frame(socket_id, true, b"", true));
         handle.send(pf_frame(socket_id, true, b"late", false));
         assert!(
-            timeout(Duration::from_millis(300), outbound.recv()).await.is_err(),
+            timeout(Duration::from_millis(300), outbound.recv())
+                .await
+                .is_err(),
             "no frame may follow the tunnel teardown"
         );
     }

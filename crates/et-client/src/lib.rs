@@ -14,7 +14,7 @@
 //! let mut session = TerminalSession::start(
 //!     "server.example.com:2022".into(),
 //!     "XXX0123456789abcd".into(),
-//!     "0123456789012345678901234567890123456789012345", // placeholder
+//!     "0123456789abcdef0123456789abcdef", // placeholder: exactly 32 bytes
 //!     &InitialPayload::default(),
 //!     et_client::session::DEFAULT_KEEPALIVE,
 //! ).await?;

@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use crate::backed::{BackedConfig, BackedEvent, BackedHandle, WriteError};
 use crate::{ConnectRequest, ConnectResponse};
-use buffa::Message as _;
 use crate::{
     ConnectStatus, DeadReason, Packet, CLIENT_SERVER_NONCE_MSB, MAX_HANDSHAKE_PROTO_LENGTH,
     PROTOCOL_VERSION, SERVER_CLIENT_NONCE_MSB,
 };
+use buffa::Message as _;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -241,7 +241,9 @@ impl EtClient {
                         tokio::time::sleep(RECONNECT_DELAY).await;
                     },
                     Some(BackedEvent::Dead(reason)) => {
-                        let _ = events_tx.send(Event::Dead(ClientDeadReason::Other(reason))).await;
+                        let _ = events_tx
+                            .send(Event::Dead(ClientDeadReason::Other(reason)))
+                            .await;
                         return;
                     }
                     None => return,
@@ -290,7 +292,9 @@ fn key_bytes(passkey: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::framing::{read_framed_packet, read_proto_frame, write_framed_packet, write_proto_frame};
+    use crate::framing::{
+        read_framed_packet, read_proto_frame, write_framed_packet, write_proto_frame,
+    };
     use crate::gen::et::{CatchupBuffer, SequenceHeader};
     use crate::{DEFAULT_MAX_PROTO_LENGTH, MAX_PACKET_LENGTH};
     use std::net::SocketAddr;
@@ -312,7 +316,10 @@ mod tests {
     async fn server_rig() -> ServerRig {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        ServerRig { listener: Arc::new(listener), addr }
+        ServerRig {
+            listener: Arc::new(listener),
+            addr,
+        }
     }
 
     async fn connect(rig: &ServerRig) -> Result<EtClient, ConnectFailure> {
@@ -324,13 +331,20 @@ mod tests {
     async fn accept_handshake(listener: &TcpListener, status: ConnectStatus) -> TcpStream {
         let (mut peer, _) = listener.accept().await.unwrap();
         peer.set_nodelay(true).ok();
-        let bytes = read_proto_frame(&mut peer, MAX_HANDSHAKE_PROTO_LENGTH).await.unwrap();
+        let bytes = read_proto_frame(&mut peer, MAX_HANDSHAKE_PROTO_LENGTH)
+            .await
+            .unwrap();
         let request = ConnectRequest::decode_from_slice(&bytes).unwrap();
         assert_eq!(request.clientId.as_deref(), Some(ID));
         assert_eq!(request.version, Some(PROTOCOL_VERSION));
-        let response =
-            ConnectResponse { status: Some(status), error: None, ..Default::default() };
-        write_proto_frame(&mut peer, &response.encode_to_vec()).await.unwrap();
+        let response = ConnectResponse {
+            status: Some(status),
+            error: None,
+            ..Default::default()
+        };
+        write_proto_frame(&mut peer, &response.encode_to_vec())
+            .await
+            .unwrap();
         peer
     }
 
@@ -385,8 +399,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_passkeys_that_are_not_32_bytes() {
         let rig = server_rig().await;
-        let err = match
-            EtClient::connect_with(rig.addr.to_string(), ID.into(), "short", KEEPALIVE).await
+        let err = match EtClient::connect_with(rig.addr.to_string(), ID.into(), "short", KEEPALIVE)
+            .await
         {
             Err(e) => e,
             Ok(_) => panic!("a short passkey must be rejected"),
@@ -422,15 +436,15 @@ mod tests {
     async fn dropping_the_client_closes_the_socket_promptly_without_keepalive() {
         let rig = server_rig().await;
         let rx = spawn_handshake(&rig, ConnectStatus::NewClient);
-        let client =
-            EtClient::connect_with(rig.addr.to_string(), ID.into(), PASSKEY, None).await.unwrap();
+        let client = EtClient::connect_with(rig.addr.to_string(), ID.into(), PASSKEY, None)
+            .await
+            .unwrap();
         let mut peer = rx.await.unwrap();
         drop(client);
 
         let mut eof = vec![0u8; 4];
         let read = timeout(Duration::from_secs(2), peer.read_exact(&mut eof)).await;
-        let read =
-            read.expect("the socket must close within 2s of dropping the client");
+        let read = read.expect("the socket must close within 2s of dropping the client");
         assert!(read.is_err(), "expected EOF after the drop, got {read:?}");
     }
 
@@ -456,7 +470,10 @@ mod tests {
             Some(Event::Dead(ClientDeadReason::ServerStateLost)) => {}
             other => panic!("expected Dead(ServerStateLost), got {other:?}"),
         }
-        assert!(client.next_event().await.is_none(), "the channel closes afterwards");
+        assert!(
+            client.next_event().await.is_none(),
+            "the channel closes afterwards"
+        );
     }
 
     /// Reconnect answered `INVALID_KEY`: the server tore the session down;
@@ -503,7 +520,9 @@ mod tests {
         client.write(1, b"pre".to_vec()).await.unwrap();
         let pre = {
             // Serialize before decrypting: the backup stores ciphertext.
-            let wire = read_framed_packet(&mut peer1, MAX_PACKET_LENGTH).await.unwrap();
+            let wire = read_framed_packet(&mut peer1, MAX_PACKET_LENGTH)
+                .await
+                .unwrap();
             let bytes = wire.serialize();
             let mut packet = wire;
             packet.decrypt(&mut pc.reader).unwrap();
@@ -520,16 +539,24 @@ mod tests {
         let exchange = tokio::spawn(async move {
             accept_handshake(&listener, ConnectStatus::MismatchedProtocol).await;
             let mut peer3 = accept_handshake(&listener, ConnectStatus::ReturningClient).await;
-            let bytes = read_proto_frame(&mut peer3, MAX_HANDSHAKE_PROTO_LENGTH).await.unwrap();
+            let bytes = read_proto_frame(&mut peer3, MAX_HANDSHAKE_PROTO_LENGTH)
+                .await
+                .unwrap();
             let sh = SequenceHeader::decode_from_slice(&bytes).unwrap();
             assert_eq!(sh.sequenceNumber, Some(0), "the peer delivered nothing");
             write_proto_frame(
                 &mut peer3,
-                &SequenceHeader { sequenceNumber: Some(0), ..Default::default() }.encode_to_vec(),
+                &SequenceHeader {
+                    sequenceNumber: Some(0),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
             )
             .await
             .unwrap();
-            let bytes = read_proto_frame(&mut peer3, DEFAULT_MAX_PROTO_LENGTH).await.unwrap();
+            let bytes = read_proto_frame(&mut peer3, DEFAULT_MAX_PROTO_LENGTH)
+                .await
+                .unwrap();
             let catchup = CatchupBuffer::decode_from_slice(&bytes).unwrap();
             write_proto_frame(&mut peer3, &CatchupBuffer::default().encode_to_vec())
                 .await
@@ -538,7 +565,11 @@ mod tests {
         });
 
         let (mut peer3, entries) = exchange.await.unwrap();
-        assert_eq!(entries.len(), 1, "the packet from the dead socket is resent");
+        assert_eq!(
+            entries.len(),
+            1,
+            "the packet from the dead socket is resent"
+        );
         assert_eq!(entries[0], pre, "catch-up resends identical ciphertext");
 
         client.write(2, b"post".to_vec()).await.unwrap();

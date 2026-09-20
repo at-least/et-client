@@ -50,13 +50,19 @@ pub fn etterminal_command(
     } else {
         &opts.etterminal_path
     };
-    let mut command =
-        format!("echo '{id}/{passkey}_{client_term}' | {bin} --verbose={}", opts.verbose);
+    let mut command = format!(
+        "echo '{id}/{passkey}_{client_term}' | {bin} --verbose={}",
+        opts.verbose
+    );
     if let Some(fifo) = &opts.server_fifo {
         command.push_str(&format!(" --serverfifo={fifo}"));
     }
     if opts.kill_existing {
-        let user = if opts.user.is_empty() { "$USER" } else { &opts.user };
+        let user = if opts.user.is_empty() {
+            "$USER"
+        } else {
+            &opts.user
+        };
         command = format!("pkill etterminal -u {user}; sleep 0.5; {command}");
     }
     command
@@ -141,7 +147,10 @@ pub fn parse_idpasskey_bytes(output: &[u8]) -> Option<IdPasskey> {
     }
     let idpasskey = std::str::from_utf8(&output[start..end]).ok()?;
     let (id, passkey) = idpasskey.split_once('/')?;
-    Some(IdPasskey { id: id.to_string(), passkey: passkey.to_string() })
+    Some(IdPasskey {
+        id: id.to_string(),
+        passkey: passkey.to_string(),
+    })
 }
 
 /// Error of [`run_ssh_handshake`].

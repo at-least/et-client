@@ -34,8 +34,7 @@ use crate::framing::{read_proto_frame, write_proto_frame};
 use crate::gen::et::{CatchupBuffer, SequenceHeader};
 use crate::packet::Packet;
 use crate::{
-    DEFAULT_MAX_PROTO_LENGTH, MAX_HANDSHAKE_PROTO_LENGTH, MAX_PACKET_LENGTH,
-    terminal_packet_type,
+    terminal_packet_type, DEFAULT_MAX_PROTO_LENGTH, MAX_HANDSHAKE_PROTO_LENGTH, MAX_PACKET_LENGTH,
 };
 use buffa::Message as _;
 use tokio::net::TcpStream;
@@ -86,9 +85,16 @@ pub enum BackedEvent {
 }
 
 enum Cmd {
-    Write { header: u8, payload: Vec<u8>, reply: oneshot::Sender<Result<(), WriteError>> },
+    Write {
+        header: u8,
+        payload: Vec<u8>,
+        reply: oneshot::Sender<Result<(), WriteError>>,
+    },
     KillSocket,
-    Recover { stream: TcpStream, reply: oneshot::Sender<bool> },
+    Recover {
+        stream: TcpStream,
+        reply: oneshot::Sender<bool>,
+    },
     Shutdown,
 }
 
@@ -113,7 +119,10 @@ pub struct BackedHandle {
 impl BackedHandle {
     /// Takes over an already-handshaked socket (`NEW_CLIENT` path). Returns
     /// the handle and the event stream.
-    pub async fn spawn(stream: TcpStream, cfg: BackedConfig) -> (Self, mpsc::Receiver<BackedEvent>) {
+    pub async fn spawn(
+        stream: TcpStream,
+        cfg: BackedConfig,
+    ) -> (Self, mpsc::Receiver<BackedEvent>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE_DEPTH);
         let actor = BackedActor::new(cfg, events_tx);
@@ -126,7 +135,11 @@ impl BackedHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .cmd_tx
-            .send(Cmd::Write { header, payload, reply: reply_tx })
+            .send(Cmd::Write {
+                header,
+                payload,
+                reply: reply_tx,
+            })
             .await
             .is_err()
         {
@@ -148,7 +161,10 @@ impl BackedHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .cmd_tx
-            .send(Cmd::Recover { stream, reply: reply_tx })
+            .send(Cmd::Recover {
+                stream,
+                reply: reply_tx,
+            })
             .await
             .is_err()
         {
@@ -319,7 +335,10 @@ impl BackedActor {
             live.io_rx.close();
         }
         if !self.dead_sent {
-            let _ = self.events_tx.send(BackedEvent::Dead(DeadReason::Shutdown)).await;
+            let _ = self
+                .events_tx
+                .send(BackedEvent::Dead(DeadReason::Shutdown))
+                .await;
         }
     }
 
@@ -337,9 +356,7 @@ impl BackedActor {
                     .await;
                 return;
             };
-            if packet.is_encrypted()
-                && packet.decrypt(&mut self.reader_crypto).is_err()
-            {
+            if packet.is_encrypted() && packet.decrypt(&mut self.reader_crypto).is_err() {
                 self.shutting_down = true;
                 self.dead_sent = true;
                 let _ = self
@@ -357,7 +374,12 @@ impl BackedActor {
                 self.waiting_on_keepalive = false;
             }
             self.reader_seq += 1;
-            if self.events_tx.send(BackedEvent::Packet(packet)).await.is_err() {
+            if self
+                .events_tx
+                .send(BackedEvent::Packet(packet))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -441,7 +463,9 @@ impl BackedActor {
             } else {
                 self.waiting_on_keepalive = true;
                 self.last_activity = Instant::now();
-                let _ = self.write(terminal_packet_type::KEEP_ALIVE, Vec::new()).await;
+                let _ = self
+                    .write(terminal_packet_type::KEEP_ALIVE, Vec::new())
+                    .await;
             }
         }
     }
@@ -454,7 +478,10 @@ impl BackedActor {
     async fn recover(&mut self, stream: TcpStream) -> bool {
         let exchange = async {
             let mut stream = stream;
-            let sh = SequenceHeader { sequenceNumber: Some(self.reader_seq as i32), ..Default::default() };
+            let sh = SequenceHeader {
+                sequenceNumber: Some(self.reader_seq as i32),
+                ..Default::default()
+            };
             write_proto_frame(&mut stream, &sh.encode_to_vec())
                 .await
                 .map_err(|e| e.to_string())?;
@@ -472,7 +499,10 @@ impl BackedActor {
             if to_recover < 0 {
                 return Err("peer claims more of our packets than we ever sent".to_string());
             }
-            let mut catchup = CatchupBuffer { buffer: Vec::new(), ..Default::default() };
+            let mut catchup = CatchupBuffer {
+                buffer: Vec::new(),
+                ..Default::default()
+            };
             if to_recover > 0 {
                 if self.backup.len() < to_recover as usize {
                     return Err(format!(
@@ -480,7 +510,12 @@ impl BackedActor {
                         self.backup.len()
                     ));
                 }
-                catchup.buffer = self.backup.iter().take(to_recover as usize).cloned().collect();
+                catchup.buffer = self
+                    .backup
+                    .iter()
+                    .take(to_recover as usize)
+                    .cloned()
+                    .collect();
                 catchup.buffer.reverse();
             }
             write_proto_frame(&mut stream, &catchup.encode_to_vec())
@@ -490,9 +525,8 @@ impl BackedActor {
             let bytes = read_proto_frame(&mut stream, DEFAULT_MAX_PROTO_LENGTH)
                 .await
                 .map_err(|e| e.to_string())?;
-            let their_catchup =
-                CatchupBuffer::decode_from_slice(&bytes)
-                    .map_err(|e| format!("bad CatchupBuffer: {e}"))?;
+            let their_catchup = CatchupBuffer::decode_from_slice(&bytes)
+                .map_err(|e| format!("bad CatchupBuffer: {e}"))?;
             Ok((stream, their_catchup.buffer))
         };
 
@@ -500,7 +534,7 @@ impl BackedActor {
         match timeout(RECOVER_TIMEOUT, exchange).await {
             Ok(Ok((stream, entries))) => {
                 drop(old); // close the superseded socket
-                // `BackedReader::revive` + `BackedWriter::revive`.
+                           // `BackedReader::revive` + `BackedWriter::revive`.
                 self.inbox.extend(entries);
                 self.disconnected_bytes = None;
                 self.last_activity = Instant::now();
@@ -521,7 +555,10 @@ impl BackedActor {
 mod tests {
     use super::*;
     use crate::framing::{read_framed_packet, write_framed_packet};
-    use crate::{CLIENT_SERVER_NONCE_MSB, DEFAULT_MAX_PROTO_LENGTH, MAX_PACKET_LENGTH, SERVER_CLIENT_NONCE_MSB};
+    use crate::{
+        CLIENT_SERVER_NONCE_MSB, DEFAULT_MAX_PROTO_LENGTH, MAX_PACKET_LENGTH,
+        SERVER_CLIENT_NONCE_MSB,
+    };
     use std::net::SocketAddr;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
@@ -565,7 +602,12 @@ mod tests {
             },
         )
         .await;
-        Rig { listener, addr, backed, events }
+        Rig {
+            listener,
+            addr,
+            backed,
+            events,
+        }
     }
 
     impl Rig {
@@ -614,11 +656,17 @@ mod tests {
         reply_entries: Vec<Vec<u8>>,
     ) -> (i32, Vec<Vec<u8>>) {
         let client_seq = read_reply_sequence_header(peer, remote_seq).await;
-        let bytes = read_proto_frame(peer, DEFAULT_MAX_PROTO_LENGTH).await.unwrap();
+        let bytes = read_proto_frame(peer, DEFAULT_MAX_PROTO_LENGTH)
+            .await
+            .unwrap();
         let catchup = CatchupBuffer::decode_from_slice(&bytes).unwrap();
         write_proto_frame(
             peer,
-            &CatchupBuffer { buffer: reply_entries, ..Default::default() }.encode_to_vec(),
+            &CatchupBuffer {
+                buffer: reply_entries,
+                ..Default::default()
+            }
+            .encode_to_vec(),
         )
         .await
         .unwrap();
@@ -628,16 +676,18 @@ mod tests {
     /// The exchange's first leg only, for peers whose `remote_seq` makes the
     /// client abort *before* sending its CatchupBuffer — reading further
     /// here would deadlock against a client that never writes again.
-    async fn read_reply_sequence_header(
-        peer: &mut tokio::net::TcpStream,
-        remote_seq: i32,
-    ) -> i32 {
-        let bytes = read_proto_frame(peer, MAX_HANDSHAKE_PROTO_LENGTH).await.unwrap();
+    async fn read_reply_sequence_header(peer: &mut tokio::net::TcpStream, remote_seq: i32) -> i32 {
+        let bytes = read_proto_frame(peer, MAX_HANDSHAKE_PROTO_LENGTH)
+            .await
+            .unwrap();
         let sh = SequenceHeader::decode_from_slice(&bytes).unwrap();
         write_proto_frame(
             peer,
-            &SequenceHeader { sequenceNumber: Some(remote_seq), ..Default::default() }
-                .encode_to_vec(),
+            &SequenceHeader {
+                sequenceNumber: Some(remote_seq),
+                ..Default::default()
+            }
+            .encode_to_vec(),
         )
         .await
         .unwrap();
@@ -677,7 +727,9 @@ mod tests {
         rig.backed.write(1, b"alpha".to_vec()).await.unwrap();
         let first_bytes = {
             // Serialize before decrypting: the backup stores ciphertext.
-            let wire = read_framed_packet(&mut peer, MAX_PACKET_LENGTH).await.unwrap();
+            let wire = read_framed_packet(&mut peer, MAX_PACKET_LENGTH)
+                .await
+                .unwrap();
             let bytes = wire.serialize();
             let mut packet = wire;
             packet.decrypt(&mut pc.reader).unwrap();
@@ -686,7 +738,9 @@ mod tests {
         };
         rig.backed.write(2, b"beta".to_vec()).await.unwrap();
         let second_bytes = {
-            let wire = read_framed_packet(&mut peer, MAX_PACKET_LENGTH).await.unwrap();
+            let wire = read_framed_packet(&mut peer, MAX_PACKET_LENGTH)
+                .await
+                .unwrap();
             let bytes = wire.serialize();
             let mut packet = wire;
             packet.decrypt(&mut pc.reader).unwrap();
@@ -695,7 +749,10 @@ mod tests {
         };
 
         rig.backed.kill_socket().await;
-        assert!(matches!(rig.events.recv().await, Some(BackedEvent::SocketDown)));
+        assert!(matches!(
+            rig.events.recv().await,
+            Some(BackedEvent::SocketDown)
+        ));
         // Writes while disconnected: buffered, still Ok (BUFFERED_ONLY).
         rig.backed.write(3, b"gamma".to_vec()).await.unwrap();
         rig.backed.write(4, b"delta".to_vec()).await.unwrap();
@@ -711,8 +768,15 @@ mod tests {
         assert!(rig.backed.recover(recover_stream).await);
 
         let (mut peer2, client_seq, entries) = exchange.await.unwrap();
-        assert_eq!(client_seq, 0, "the peer sent nothing, so the client read 0 packets");
-        assert_eq!(entries.len(), 4, "everything ever written, connected or not");
+        assert_eq!(
+            client_seq, 0,
+            "the peer sent nothing, so the client read 0 packets"
+        );
+        assert_eq!(
+            entries.len(),
+            4,
+            "everything ever written, connected or not"
+        );
         assert_eq!(entries[0], first_bytes, "catch-up resends identical bytes");
         assert_eq!(entries[1], second_bytes);
         for (entry, (header, payload)) in entries[2..]
@@ -765,7 +829,9 @@ mod tests {
         assert_eq!(packet.header(), 2);
         assert_eq!(packet.payload(), b"after");
         assert!(
-            timeout(Duration::from_millis(150), rig.events.recv()).await.is_err(),
+            timeout(Duration::from_millis(150), rig.events.recv())
+                .await
+                .is_err(),
             "a failed recover must not emit SocketDown for the live socket"
         );
     }
@@ -785,7 +851,10 @@ mod tests {
         read_client_packet(&mut peer, &mut pc.reader).await;
 
         rig.backed.kill_socket().await;
-        assert!(matches!(rig.events.recv().await, Some(BackedEvent::SocketDown)));
+        assert!(matches!(
+            rig.events.recv().await,
+            Some(BackedEvent::SocketDown)
+        ));
 
         let recover_stream = rig.connect_extra().await;
         let mut peer2 = rig.accept().await;
@@ -813,7 +882,10 @@ mod tests {
             rig.backed.write(1, vec![i as u8; MIB]).await.unwrap();
         }
         rig.backed.kill_socket().await;
-        assert!(matches!(rig.events.recv().await, Some(BackedEvent::SocketDown)));
+        assert!(matches!(
+            rig.events.recv().await,
+            Some(BackedEvent::SocketDown)
+        ));
 
         let recover_stream = rig.connect_extra().await;
         let mut peer2 = rig.accept().await;
@@ -840,7 +912,10 @@ mod tests {
         let mut rig = rig(None).await;
         let _peer = rig.accept().await;
         rig.backed.kill_socket().await;
-        assert!(matches!(rig.events.recv().await, Some(BackedEvent::SocketDown)));
+        assert!(matches!(
+            rig.events.recv().await,
+            Some(BackedEvent::SocketDown)
+        ));
 
         const MIB: usize = 1024 * 1024;
         for i in 0..60usize {
@@ -864,7 +939,11 @@ mod tests {
             packet.decrypt(&mut reader).unwrap();
             assert_eq!(packet.header(), 1);
             assert_eq!(packet.payload().len(), MIB);
-            assert_eq!(packet.payload()[0], i as u8, "delivery order must be chronological");
+            assert_eq!(
+                packet.payload()[0],
+                i as u8,
+                "delivery order must be chronological"
+            );
         }
 
         // Back to live: traffic flows on the new socket.
@@ -882,10 +961,17 @@ mod tests {
         let _peer = rig.accept().await;
         let mut pc = peer_crypto();
         rig.backed.kill_socket().await;
-        assert!(matches!(rig.events.recv().await, Some(BackedEvent::SocketDown)));
+        assert!(matches!(
+            rig.events.recv().await,
+            Some(BackedEvent::SocketDown)
+        ));
 
         let big = vec![0u8; DISCONNECT_BUFFER_BYTES as usize];
-        assert_eq!(rig.backed.write(1, big).await, Ok(()), "exactly at the limit still buffers");
+        assert_eq!(
+            rig.backed.write(1, big).await,
+            Ok(()),
+            "exactly at the limit still buffers"
+        );
         assert_eq!(
             rig.backed.write(2, b"x".to_vec()).await,
             Err(WriteError::Skipped),
@@ -938,7 +1024,10 @@ mod tests {
                 Some(BackedEvent::Dead(DeadReason::CryptoMismatch)) => {}
                 other => panic!("expected Dead(CryptoMismatch), got {other:?}"),
             }
-            assert_eq!(rig.backed.write(1, b"x".to_vec()).await, Err(WriteError::Shutdown));
+            assert_eq!(
+                rig.backed.write(1, b"x".to_vec()).await,
+                Err(WriteError::Shutdown)
+            );
             // The Dead event is the *only* terminal event: the channel then
             // closes without a second, reason-less Dead.
             assert!(rig.events.recv().await.is_none());
@@ -952,7 +1041,10 @@ mod tests {
         let mut rig = rig(None).await;
         let _peer = rig.accept().await;
         drop(rig.backed);
-        assert!(matches!(rig.events.recv().await, Some(BackedEvent::Dead(DeadReason::Shutdown))));
+        assert!(matches!(
+            rig.events.recv().await,
+            Some(BackedEvent::Dead(DeadReason::Shutdown))
+        ));
         assert!(rig.events.recv().await.is_none());
     }
 
@@ -966,18 +1058,40 @@ mod tests {
         let mut pc = peer_crypto();
 
         // The actor ticks once a second; the first idle tick (~1s) pings.
-        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader)).await.unwrap();
+        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader))
+            .await
+            .unwrap();
         assert_eq!(ping.header(), terminal_packet_type::KEEP_ALIVE);
         assert!(ping.payload().is_empty());
 
-        send_peer_packet(&mut peer, &mut pc.writer, terminal_packet_type::KEEP_ALIVE, &[]).await;
+        send_peer_packet(
+            &mut peer,
+            &mut pc.writer,
+            terminal_packet_type::KEEP_ALIVE,
+            &[],
+        )
+        .await;
 
-        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader)).await.unwrap();
-        assert_eq!(ping.header(), terminal_packet_type::KEEP_ALIVE, "the echo reset the flag");
+        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader))
+            .await
+            .unwrap();
+        assert_eq!(
+            ping.header(),
+            terminal_packet_type::KEEP_ALIVE,
+            "the echo reset the flag"
+        );
 
         // A second full cycle: the reset persists, the socket stays up.
-        send_peer_packet(&mut peer, &mut pc.writer, terminal_packet_type::KEEP_ALIVE, &[]).await;
-        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader)).await.unwrap();
+        send_peer_packet(
+            &mut peer,
+            &mut pc.writer,
+            terminal_packet_type::KEEP_ALIVE,
+            &[],
+        )
+        .await;
+        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader))
+            .await
+            .unwrap();
         assert_eq!(ping.header(), terminal_packet_type::KEEP_ALIVE);
     }
 
@@ -989,7 +1103,9 @@ mod tests {
         let mut peer = rig.accept().await;
         let mut pc = peer_crypto();
 
-        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader)).await.unwrap();
+        let ping = timeout(LONG, read_client_packet(&mut peer, &mut pc.reader))
+            .await
+            .unwrap();
         assert_eq!(ping.header(), terminal_packet_type::KEEP_ALIVE);
         // Deliberately no echo.
 
@@ -999,7 +1115,9 @@ mod tests {
         }
         assert_eq!(rig.backed.write(1, b"buffered".to_vec()).await, Ok(()));
         assert!(
-            timeout(Duration::from_millis(300), rig.events.recv()).await.is_err(),
+            timeout(Duration::from_millis(300), rig.events.recv())
+                .await
+                .is_err(),
             "keepalive loss disconnects but does not kill the session"
         );
     }

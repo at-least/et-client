@@ -20,7 +20,11 @@ impl Packet {
 
     /// `Packet(header, payload)` — a decrypted, unencrypted packet.
     pub fn new(header: u8, payload: Vec<u8>) -> Self {
-        Self { encrypted: false, header, payload }
+        Self {
+            encrypted: false,
+            header,
+            payload,
+        }
     }
 
     /// `Packet::deserialize(serializedPacket)`.
@@ -31,7 +35,11 @@ impl Packet {
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         let (&flags, rest) = bytes.split_first()?;
         let (&header, payload) = rest.split_first()?;
-        Some(Self { encrypted: flags != 0, header, payload: payload.to_vec() })
+        Some(Self {
+            encrypted: flags != 0,
+            header,
+            payload: payload.to_vec(),
+        })
     }
 
     /// `Packet::serialize`.
@@ -47,14 +55,23 @@ impl Packet {
     /// already-encrypted packet is the "already encrypted" `STFATAL` path
     /// upstream; it is a bug in the caller, so it panics.
     pub fn encrypt(&mut self, crypto: &mut crate::CryptoHandler) {
-        assert!(!self.encrypted, "tried to encrypt a packet that was already encrypted");
+        assert!(
+            !self.encrypted,
+            "tried to encrypt a packet that was already encrypted"
+        );
         self.payload = crypto.encrypt(&self.payload);
         self.encrypted = true;
     }
 
     /// `Packet::decrypt` — decrypts the payload in place.
-    pub fn decrypt(&mut self, crypto: &mut crate::CryptoHandler) -> Result<(), crate::crypto::CryptoError> {
-        assert!(self.encrypted, "tried to decrypt a packet that wasn't encrypted");
+    pub fn decrypt(
+        &mut self,
+        crypto: &mut crate::CryptoHandler,
+    ) -> Result<(), crate::crypto::CryptoError> {
+        assert!(
+            self.encrypted,
+            "tried to decrypt a packet that wasn't encrypted"
+        );
         self.payload = crypto.decrypt(&self.payload)?;
         self.encrypted = false;
         Ok(())
@@ -103,7 +120,10 @@ mod tests {
         // serialized packets whose payload is still ciphertext.
         let mut sender = crate::CryptoHandler::new(&[7u8; 32], crate::CLIENT_SERVER_NONCE_MSB);
         let mut receiver = crate::CryptoHandler::new(&[7u8; 32], crate::CLIENT_SERVER_NONCE_MSB);
-        let mut p = Packet::new(crate::terminal_packet_type::TERMINAL_BUFFER, b"data".to_vec());
+        let mut p = Packet::new(
+            crate::terminal_packet_type::TERMINAL_BUFFER,
+            b"data".to_vec(),
+        );
         p.encrypt(&mut sender);
         assert!(p.is_encrypted());
         let stored = p.serialize();

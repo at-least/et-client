@@ -60,7 +60,13 @@ impl CryptoHandler {
         self.increment_nonce();
         let nonce = GenericArray::from_slice(&self.nonce);
         self.cipher
-            .encrypt(nonce, Payload { msg: plaintext, aad: &[] })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &[],
+                },
+            )
             .expect("XSalsa20-Poly1305 encryption cannot fail")
     }
 
@@ -78,7 +84,13 @@ impl CryptoHandler {
         self.increment_nonce();
         let nonce = GenericArray::from_slice(&self.nonce);
         self.cipher
-            .decrypt(nonce, Payload { msg: ciphertext, aad: &[] })
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &[],
+                },
+            )
             .map_err(|_| CryptoError::DecryptFailed)
     }
 }
@@ -132,7 +144,10 @@ mod tests {
         assert!(matches!(b.decrypt(&c), Err(CryptoError::DecryptFailed)));
         let mut tampered = c.clone();
         tampered[0] ^= 1;
-        assert!(matches!(a.decrypt(&tampered), Err(CryptoError::DecryptFailed)));
+        assert!(matches!(
+            a.decrypt(&tampered),
+            Err(CryptoError::DecryptFailed)
+        ));
     }
 
     #[test]

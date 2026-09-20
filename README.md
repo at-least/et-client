@@ -159,13 +159,17 @@ Forward and reverse TCP tunnels are implemented in the library:
 [`parse_ranges`](crates/et-proto/src/forward.rs) accepts `18000:8000`,
 range syntax `a-b:c-d`, comma lists, and ssh-style
 `bind:port:host:hostport` (like upstream `TunnelUtils`); the client passes
-sources to `TerminalSession::start_port_forwarding`, and reverse sources
+sources to `TerminalSession::start_port_forwarding` (which combines with
+reverse tunnels declared in the `INITIAL_PAYLOAD`), and reverse sources
 ride the `INITIAL_PAYLOAD`. The engine lives in `et_proto::forward` and is
 role-symmetric: sources bind locally and emit `DESTINATION_REQUEST`s;
 destinations connect `::1` then `127.0.0.1` like upstream (the destination
-*name* is ignored for TCP). Unix-socket forwarding (`ENV:/path`, SSH agent)
-is not supported — the parser accepts those forms but rejects them with a
-clear error. Interop tests cover both directions against the C++ etserver.
+*name* is ignored for TCP). The engine stops with the session —
+`TerminalSession::shutdown` or dropping the session releases its
+listeners and tears down tunneled connections. Unix-socket forwarding
+(`ENV:/path`, SSH agent) is not supported — the parser accepts those
+forms but rejects them with a clear error, as it does ports outside
+0–65535. Interop tests cover both directions against the C++ etserver.
 
 ## Jumphost
 
