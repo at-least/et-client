@@ -1014,7 +1014,7 @@ mod tests {
         let mut rig = rig(None).await;
         // The peer accepts but never reads: kernel buffers fill, the
         // writer task stalls, the queue fills.
-        let mut peer = rig.accept().await;
+        let peer = rig.accept().await;
 
         // 32 MiB: past the kernel buffers and the 1024-frame queue.
         for _ in 0..2048 {
