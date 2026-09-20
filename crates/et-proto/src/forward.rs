@@ -18,6 +18,8 @@
 //! ports (upstream clients would).
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -230,6 +232,9 @@ const EVENT_QUEUE_DEPTH: usize = 1024;
 /// the session pump is not draining, the last backpressure stage before
 /// the backed layer's own 64 MiB caps.
 const OUTBOUND_QUEUE_DEPTH: usize = 256;
+/// Backoff after a failed `accept()` (transient per-connection or resource
+/// errors; the loop retries instead of killing the source listener).
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// A running engine. Feed it the peer's port-forward packets; it emits the
 /// frames to write back to the session. The engine stops — listeners
@@ -425,7 +430,37 @@ fn spawn_accept_task(
     listener: TcpListener,
     source_idx: usize,
     events: mpsc::Sender<Event>,
+    shutdown: watch::Receiver<bool>,
+) {
+    spawn_accepter(source_idx, events, shutdown, listener);
+}
+
+/// The accept operation behind [`spawn_accept_task`], as a trait so tests
+/// can inject failures.
+trait Accepter {
+    type Fut<'a>: Future<Output = std::io::Result<(TcpStream, std::net::SocketAddr)>> + Send + 'a
+    where
+        Self: 'a;
+    fn accept(&mut self) -> Self::Fut<'_>;
+}
+
+impl Accepter for TcpListener {
+    type Fut<'a> =
+        Pin<Box<dyn Future<Output = std::io::Result<(TcpStream, std::net::SocketAddr)>> + Send + 'a>>
+    where
+        Self: 'a;
+    fn accept(&mut self) -> Self::Fut<'_> {
+        Box::pin(TcpListener::accept(self))
+    }
+}
+
+/// The accept loop behind [`spawn_accept_task`], generic over the accept
+/// operation.
+fn spawn_accepter<A: Accepter + Send + 'static>(
+    source_idx: usize,
+    events: mpsc::Sender<Event>,
     mut shutdown: watch::Receiver<bool>,
+    mut acceptor: A,
 ) {
     tokio::spawn(async move {
         loop {
@@ -435,7 +470,7 @@ fn spawn_accept_task(
                         return;
                     }
                 }
-                accepted = listener.accept() => {
+                accepted = acceptor.accept() => {
                     match accepted {
                         Ok((stream, _)) => {
                             if events
@@ -446,7 +481,14 @@ fn spawn_accept_task(
                                 return;
                             }
                         }
-                        Err(_) => return,
+                        Err(_) => {
+                            // Transient conditions (a peer reset between
+                            // connect and accept, EMFILE under fd
+                            // pressure): the listener stays usable, so back
+                            // off briefly and keep accepting — returning
+                            // here would silently disable the tunnel source.
+                            tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                        }
                     }
                 }
             }
@@ -1220,6 +1262,62 @@ mod tests {
             errors[0].contains(&format!("127.0.0.1:{port}")),
             "{errors:?}"
         );
+    }
+
+    /// A transient `accept()` error (ECONNABORTED, EMFILE) must not
+    /// permanently kill the source listener: the accept loop retries after
+    /// a short backoff. Returning instead would silently disable a tunnel
+    /// source with no diagnostic, long after `start_port_forwarding`
+    /// reported success.
+    #[tokio::test]
+    async fn accept_errors_do_not_kill_the_source_listener() {
+        // A real connection is queued before the error fires, so the
+        // retried accept returns it without further setup.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let acceptor = FailFirstAccept {
+            failed: false,
+            listener: Some(listener),
+        };
+        let (events, mut events_rx) = mpsc::channel(4);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        spawn_accepter(3, events, shutdown_rx, acceptor);
+
+        match timeout(Duration::from_secs(2), events_rx.recv()).await {
+            Ok(Some(Event::Accepted { source_idx: 3, .. })) => {}
+            other => panic!("the accept loop must survive a transient error, got {other:?}"),
+        }
+    }
+
+    /// [`Accepter`] that fails once (an injected transient error), then
+    /// delegates to the real listener.
+    struct FailFirstAccept {
+        failed: bool,
+        listener: Option<TcpListener>,
+    }
+
+    impl Accepter for FailFirstAccept {
+        type Fut<'a> = Pin<
+            Box<dyn Future<Output = std::io::Result<(TcpStream, std::net::SocketAddr)>> + Send + 'a>,
+        > where
+            Self: 'a;
+        fn accept(&mut self) -> Self::Fut<'_> {
+            Box::pin(async move {
+                if !self.failed {
+                    self.failed = true;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "injected transient accept error",
+                    ));
+                }
+                self.listener
+                    .as_mut()
+                    .expect("one real accept")
+                    .accept()
+                    .await
+            })
+        }
     }
 
     /// Dropping every handle is a shutdown: the engine task ends, the
