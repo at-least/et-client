@@ -1177,11 +1177,7 @@ mod tests {
     /// the same) — reject loudly instead, like every other malformed form.
     #[test]
     fn reversed_ranges_are_rejected_not_silently_dropped() {
-        for input in [
-            "9000-8000:8000-7000",
-            "9000-8000:7000-8000",
-            "8000-9000:7000-8000",
-        ] {
+        for input in ["9000-8000:8000-7000", "9000-8000:7000-8000"] {
             assert!(
                 parse_ranges(input).is_err(),
                 "transposed range {input} must be rejected, got {:?}",
