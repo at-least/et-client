@@ -147,6 +147,15 @@ fn process_et_style(
             parse_port(dst_range[0], input)?,
             parse_port(dst_range[1], input)?,
         );
+        if src_end < src_start || dst_end < dst_start {
+            // Divergence from upstream (loud where it is silent): both
+            // ends transposed by the same amount pass the length check
+            // below but expand to zero sources — reject the typo instead.
+            return Err(TunnelParseError::Invalid(
+                input.into(),
+                "port ranges must be ascending (start-end)".into(),
+            ));
+        }
         if src_end - src_start != dst_end - dst_start {
             return Err(TunnelParseError::RangeLengthMismatch);
         }
@@ -1161,6 +1170,24 @@ mod tests {
             parse_ranges("18000"),
             Err(TunnelParseError::MissingDestination)
         ));
+    }
+
+    /// Both ends transposed by the same amount pass the length check and
+    /// would silently expand to zero sources (upstream's loop bound does
+    /// the same) — reject loudly instead, like every other malformed form.
+    #[test]
+    fn reversed_ranges_are_rejected_not_silently_dropped() {
+        for input in [
+            "9000-8000:8000-7000",
+            "9000-8000:7000-8000",
+            "8000-9000:7000-8000",
+        ] {
+            assert!(
+                parse_ranges(input).is_err(),
+                "transposed range {input} must be rejected, got {:?}",
+                parse_ranges(input)
+            );
+        }
     }
 
     #[test]
