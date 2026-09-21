@@ -888,12 +888,12 @@ mod tests {
         let pf = PortForwardDestinationResponse::decode_from_slice(response.payload()).unwrap();
         let stalled_id = pf.socketid.expect("the stalled destination opened");
 
-        // Flood the stalled destination with 4 KiB frames until the
+        // Flood the stalled destination with 64 KiB frames until the
         // engine wedges in the data path and the pump parks on the full
-        // inbound queue (the queues are frame-counted, so the wedge point
-        // is stable; the session's own event chain stays well below its
-        // capacity — the death must stay routable through it). The pump
-        // runs alongside; when the flood
+        // inbound queue: big frames minimize kernel absorption (~2-4
+        // frames) so the wedge is deterministic while the session's own
+        // event chain stays well below its capacity — the death must stay
+        // routable through it. The pump runs alongside; when the flood
         // task finishes, dropping the peer's write half kills the ET
         // socket (the supervisor reconnects; the mock answers NEW_CLIENT —
         // the terminal ServerStateLost path).
@@ -901,11 +901,11 @@ mod tests {
         let mut to_client = rig.to_client;
         let flood = tokio::spawn(async move {
             let mut peer = write_half;
-            for _ in 0..1200 {
+            for _ in 0..700 {
                 let data = PortForwardData {
                     sourcetodestination: Some(true),
                     socketid: Some(stalled_id),
-                    buffer: Some(vec![0u8; 4 * 1024]),
+                    buffer: Some(vec![0u8; 64 * 1024]),
                     ..Default::default()
                 };
                 let mut frame = Packet::new(PORT_FORWARD_HEADER, data.encode_to_vec());
