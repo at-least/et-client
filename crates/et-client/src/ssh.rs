@@ -130,7 +130,11 @@ pub fn parse_idpasskey_output(output: &str) -> Option<IdPasskey> {
 
 /// Byte-level variant of [`parse_idpasskey_output`]: motd noise around the
 /// marker is arbitrary bytes, so slicing the `&str` could panic on a char
-/// boundary; the id/passkey payload itself must be ASCII.
+/// boundary; the id/passkey payload itself must be the upstream
+/// `genRandomAlphaNum` alphabet — which is what keeps
+/// [`etterminal_command`]'s unescaped single-quoting shell-safe (a
+/// compromised SSH-leg endpoint controls these bytes, a quote there would
+/// break out of the quoting in any command built from them).
 pub fn parse_idpasskey_bytes(output: &[u8]) -> Option<IdPasskey> {
     let marker = IDPASSKEY_MARKER.as_bytes();
     let mut start = None;
@@ -147,6 +151,13 @@ pub fn parse_idpasskey_bytes(output: &[u8]) -> Option<IdPasskey> {
     }
     let idpasskey = std::str::from_utf8(&output[start..end]).ok()?;
     let (id, passkey) = idpasskey.split_once('/')?;
+    if !id
+        .bytes()
+        .chain(passkey.bytes())
+        .all(|b| b.is_ascii_alphanumeric())
+    {
+        return None;
+    }
     Some(IdPasskey {
         id: id.to_string(),
         passkey: passkey.to_string(),
@@ -244,6 +255,30 @@ mod tests {
         noisy.extend_from_slice(b" trailing \xe5\xba\x8f");
         assert_eq!(parse_idpasskey_bytes(&noisy).unwrap(), ip);
         assert!(parse_idpasskey_bytes(b"IDPASSKEY:\xff\xfe/xxx").is_none());
+    }
+
+    /// The id/passkey alphabet is what makes `etterminal_command`'s
+    /// unescaped single-quoting safe (upstream `genCommand` parity): the
+    /// parser must enforce it, not assume it — a compromised SSH-leg
+    /// endpoint controls these bytes, and a quote there would break out
+    /// of the quoting in any later command built from them.
+    #[test]
+    fn parse_idpasskey_rejects_non_alphanumeric_payloads() {
+        // Exactly 16 + '/' + 32 bytes after the marker, with a quote in
+        // the passkey window: length-valid, charset-invalid.
+        let shell_breakout = format!(
+            "IDPASSKEY:XXXabcdefghijklmnop/{}'{}",
+            "a".repeat(15),
+            "b".repeat(16)
+        );
+        assert!(
+            parse_idpasskey_output(&shell_breakout).is_none(),
+            "a payload with shell metacharacters must be rejected"
+        );
+        // The shape is only checked past the marker: noise before it
+        // stays arbitrary.
+        let honest = format!("IDPASSKEY:XXXabcdefghijklmnop/{}", "k".repeat(32));
+        assert!(parse_idpasskey_output(&honest).is_some());
     }
 
     #[test]
