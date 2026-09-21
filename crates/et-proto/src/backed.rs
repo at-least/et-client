@@ -509,7 +509,10 @@ impl BackedActor {
                     // would freeze keepalive enforcement and the recover
                     // exchange (upstream's reader thread would keep
                     // running; this actor must not depend on socket
-                    // progress to stay alive).
+                    // progress to stay alive). The failed packet stays in
+                    // the backup undelivered, so it opens the disconnect
+                    // ledger — otherwise the budget could overshoot by it.
+                    *self.disconnected_bytes.get_or_insert(0) += serialized.len() as i64;
                     self.close_current_socket();
                 }
                 self.last_activity = Instant::now();
@@ -1257,6 +1260,40 @@ mod tests {
             Ok(Ok(())) => {}
             other => panic!("write must be served while events back up, got {other:?}"),
         }
+    }
+
+    /// The write that kills a full socket stays in the backup and must
+    /// count toward the disconnect budget: otherwise the first write
+    /// after the kill is admitted against a ledger that forgot it and the
+    /// buffer overshoots `DISCONNECT_BUFFER_BYTES` by one packet.
+    #[tokio::test]
+    async fn the_packet_that_kills_a_full_socket_counts_toward_the_budget() {
+        let mut rig = rig(None).await;
+        // The peer accepts but never reads: the writer task stalls in
+        // write_all, the 1024-frame write queue fills, and the next write
+        // kills the socket — that packet stays in the backup undelivered.
+        // Stop at the kill so nothing else enters the disconnect ledger.
+        let peer = rig.accept().await;
+        loop {
+            rig.backed.write(1, vec![0u8; 16 * 1024]).await.unwrap();
+            if matches!(
+                timeout(Duration::from_millis(1), rig.events.recv()).await,
+                Ok(Some(BackedEvent::SocketDown))
+            ) {
+                break;
+            }
+        }
+
+        // A full-budget write must not be admitted on top of the killing
+        // packet still sitting in the backup.
+        assert_eq!(
+            rig.backed
+                .write(1, vec![0u8; DISCONNECT_BUFFER_BYTES as usize])
+                .await,
+            Err(WriteError::Skipped),
+            "the killing packet must already count against the budget"
+        );
+        drop(peer);
     }
 
     /// Dropping every handle is a shutdown: the actor drains, reports
