@@ -45,8 +45,8 @@ pub const SERVER_CLIENT_NONCE_MSB: u8 = 1;
 /// pre-crypto message (`ConnectRequest`, `ConnectResponse`, `SequenceHeader`,
 /// `CatchupBuffer`).
 pub const MAX_HANDSHAKE_PROTO_LENGTH: i64 = 4 * 1024;
-/// Upstream `SocketHandler::DEFAULT_MAX_PROTO_LENGTH` — cap for post-crypto
-/// protobuf frames on the unix leg.
+/// Upstream `SocketHandler::DEFAULT_MAX_PROTO_LENGTH` — cap for large
+/// protobuf frames (the recover exchange's `CatchupBuffer`).
 pub const DEFAULT_MAX_PROTO_LENGTH: i64 = 128 * 1024 * 1024;
 /// Sanity cap for the `u32`-framed packet length on TCP legs. Upstream does
 /// not bound this before allocating; 128 MiB matches the upstream cap used

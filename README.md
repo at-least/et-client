@@ -61,9 +61,9 @@ et (client) ──TCP 2022── etserver ──unix socket── etterminal (PT
    missed echo kills the socket and reconnect takes over.
 
 The unix leg (etserver↔etterminal, an `AF_UNIX` stream despite the
-historical "fifo" name) is unencrypted and asymmetric: registration/init are
-`[i64 LE length][packet]` frames; toward the terminal the server writes
-`[type:u8][i64-framed proto]`; terminal output is a raw byte stream.
+historical "fifo" name) is upstream-only territory: this repo is a client
+library and implements nothing on it — the recover exchange below reuses the
+`i64`-LE handshake framing on the TCP leg.
 
 **Protobuf codegen.** The message types in `crates/et-proto/src/gen/` are
 generated from `proto/*.proto` with [buffa](https://github.com/anthropics/buffa)
