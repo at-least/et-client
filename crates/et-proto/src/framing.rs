@@ -1,18 +1,12 @@
 //! Frame formats. Two coexist, both inherited from upstream:
 //!
-//! - **`i64` LE length prefix** (`SocketHandler::readProto`/`writeProto` and
-//!   `SocketHandler::readPacket`/`writePacket`): used for every handshake
-//!   message (`ConnectRequest`, `ConnectResponse`, `SequenceHeader`,
-//!   `CatchupBuffer`), and on the unix leg (`etserver`↔`etterminal`) for
-//!   registration/init packets and the typed routing frames. Upstream writes
-//!   a native-endian `int64_t`; every platform ET supports is little-endian,
-//!   so the wire order is little-endian.
+//! - **`i64` LE length prefix** (`SocketHandler::readProto`/`writeProto`):
+//!   used for every handshake message (`ConnectRequest`, `ConnectResponse`,
+//!   `SequenceHeader`, `CatchupBuffer`). Upstream writes a native-endian
+//!   `int64_t`; every platform ET supports is little-endian, so the wire
+//!   order is little-endian.
 //! - **`u32` BE length prefix** (`BackedReader`/`BackedWriter`): the
 //!   encrypted packet stream on the TCP legs (`et`↔`etserver`).
-//!
-//! Toward the terminal the server prefixes a one-byte packet type before an
-//! `i64`-framed protobuf ([`write_typed_proto`]); terminal output flows back
-//! as a raw byte stream with no framing at all ([`write_unframed`]).
 
 use crate::packet::Packet;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -73,24 +67,6 @@ pub async fn write_proto_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// `SocketHandler::readPacket` (unix leg): `i64`-LE length + serialized
-/// [`Packet`].
-pub async fn read_packet_frame<R: AsyncRead + Unpin>(
-    r: &mut R,
-    max_len: i64,
-) -> Result<Packet, FrameError> {
-    let bytes = read_proto_frame(r, max_len).await?;
-    Packet::parse(&bytes).ok_or(FrameError::InvalidPacket)
-}
-
-/// `SocketHandler::writePacket` (unix leg).
-pub async fn write_packet_frame<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    packet: &Packet,
-) -> Result<(), FrameError> {
-    write_proto_frame(w, &packet.serialize()).await
-}
-
 /// `BackedReader` frame: `u32` BE length + serialized [`Packet`] (TCP legs).
 pub async fn read_framed_packet<R: AsyncRead + Unpin>(
     r: &mut R,
@@ -121,62 +97,6 @@ pub async fn write_framed_packet<W: AsyncWrite + Unpin>(
     w.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
     w.write_all(&bytes).await?;
     Ok(())
-}
-
-/// Server→terminal routing frame: one type byte ([`crate::terminal_packet_type`])
-/// followed by an `i64`-LE framed protobuf.
-pub async fn write_typed_proto<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    packet_type: u8,
-    proto_bytes: &[u8],
-) -> Result<(), FrameError> {
-    w.write_all(&[packet_type]).await?;
-    write_proto_frame(w, proto_bytes).await
-}
-
-/// Terminal→server direction: a raw byte stream with no framing
-/// (`UserTerminalHandler::runUserTerminal` writes pty output raw; the server
-/// `read()`s it raw).
-pub async fn write_unframed<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    bytes: &[u8],
-) -> Result<(), FrameError> {
-    w.write_all(bytes).await?;
-    Ok(())
-}
-
-/// Incremental variant of [`read_proto_frame`] for byte-stream buffers:
-/// pulls one `i64`-LE framed message out of `buf` in place. Returns `None`
-/// when more bytes are needed. Malformed frames drain the buffer and yield
-/// `Some(Err(...))`.
-pub fn try_parse_proto_frame(buf: &mut Vec<u8>) -> Option<Result<Vec<u8>, FrameError>> {
-    if buf.len() < 8 {
-        return None;
-    }
-    let len = i64::from_le_bytes(buf[..8].try_into().ok()?);
-    if !(0..=128 * 1024 * 1024).contains(&len) {
-        buf.clear();
-        return Some(Err(FrameError::InvalidLength(len)));
-    }
-    let total = 8 + len as usize;
-    if buf.len() < total {
-        return None;
-    }
-    let bytes: Vec<u8> = buf.drain(..total).collect();
-    Some(Ok(bytes[8..].to_vec()))
-}
-
-/// [`try_parse_proto_frame`] for full packets (unix-leg jump relay).
-pub fn try_parse_packet_frame_from_buffer(
-    buf: &mut Vec<u8>,
-) -> Option<Result<crate::packet::Packet, FrameError>> {
-    match try_parse_proto_frame(buf) {
-        None => None,
-        Some(Err(e)) => Some(Err(e)),
-        Some(Ok(bytes)) => {
-            Some(crate::packet::Packet::parse(&bytes).ok_or(FrameError::InvalidPacket))
-        }
-    }
 }
 
 #[cfg(test)]
@@ -252,28 +172,5 @@ mod tests {
                 .unwrap(),
             p
         );
-    }
-
-    #[tokio::test]
-    async fn unix_packet_frame_and_typed_proto() {
-        let mut buf = Vec::new();
-        let p = Packet::new(
-            crate::terminal_packet_type::TERMINAL_USER_INFO,
-            b"x".to_vec(),
-        );
-        write_packet_frame(&mut buf, &p).await.unwrap();
-        assert_eq!(read_packet_frame(&mut &buf[..], 1024).await.unwrap(), p);
-
-        let mut buf = Vec::new();
-        write_typed_proto(
-            &mut buf,
-            crate::terminal_packet_type::TERMINAL_BUFFER,
-            b"hi",
-        )
-        .await
-        .unwrap();
-        assert_eq!(buf[0], crate::terminal_packet_type::TERMINAL_BUFFER);
-        let proto = read_proto_frame(&mut &buf[1..], 1024).await.unwrap();
-        assert_eq!(proto, b"hi");
     }
 }

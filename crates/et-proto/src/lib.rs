@@ -11,11 +11,8 @@
 //! Two frame formats coexist (both inherited from upstream):
 //! - **TCP legs** (`et`↔`etserver`): `[u32 BE length][packet]` where a packet
 //!   is `[encrypted: u8][header: u8][payload]`.
-//! - **Unix leg** (`etserver`↔`etterminal`) and every handshake message:
-//!   `[i64 LE length][bytes]`, where the bytes are a serialized protobuf
-//!   message or a serialized packet. Toward the terminal the server prefixes
-//!   a one-byte packet type before the framed protobuf (see
-//!   [`write_typed_proto`]).
+//! - **Every handshake message**: `[i64 LE length][bytes]`, where the bytes
+//!   are a serialized protobuf message.
 
 pub mod backed;
 pub mod client;
@@ -29,8 +26,7 @@ pub mod packet;
 pub use backed::{BackedConfig, BackedEvent, BackedHandle, DeadReason, WriteError};
 pub use crypto::CryptoHandler;
 pub use framing::{
-    read_framed_packet, read_packet_frame, read_proto_frame, write_framed_packet,
-    write_packet_frame, write_proto_frame, write_typed_proto, write_unframed, FrameError,
+    read_framed_packet, read_proto_frame, write_framed_packet, write_proto_frame, FrameError,
 };
 pub use gen::et::*;
 pub use packet::Packet;

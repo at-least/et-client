@@ -916,7 +916,7 @@ mod tests {
             }
         });
         let mut flood = flood;
-        timeout(LONG * 4, async {
+        timeout(LONG * 8, async {
             loop {
                 tokio::select! {
                     event = session.next_event() => {

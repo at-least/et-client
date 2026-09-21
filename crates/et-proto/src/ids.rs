@@ -41,16 +41,6 @@ pub fn generate_id_passkey() -> (String, String) {
     )
 }
 
-/// The server-side regeneration (`TerminalMain.cpp`): a client-supplied id
-/// starting with `XXX` is replaced wholesale.
-pub fn regen_if_client_chosen(id: &str) -> Option<(String, String)> {
-    if id.starts_with("XXX") {
-        Some(generate_id_passkey())
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,11 +57,5 @@ mod tests {
                 .chain(passkey.bytes())
                 .all(|b| ALPHANUM.contains(&b)));
         }
-    }
-
-    #[test]
-    fn regen_only_for_xxx() {
-        assert!(regen_if_client_chosen("XXXabcdefghijklmnop").is_some());
-        assert!(regen_if_client_chosen("abcXXXdefghijklmno").is_none());
     }
 }
