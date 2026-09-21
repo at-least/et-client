@@ -11,6 +11,7 @@ buffa.workspace = true
 crypto_secretbox.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
+zeroize.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "sync", "time"] }
 
 [dev-dependencies]

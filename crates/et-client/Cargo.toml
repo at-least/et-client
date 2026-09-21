@@ -12,6 +12,7 @@ buffa.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 # rt-multi-thread: the PF-flood backpressure test needs worker parallelism.

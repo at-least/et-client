@@ -127,6 +127,16 @@ pub struct BackedConfig {
     pub keepalive: Option<Duration>,
 }
 
+impl Drop for BackedConfig {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        // Defense-in-depth beyond upstream: the key copy this struct owns
+        // does not outlive the session on the heap. (The cipher's internal
+        // copy is unreachable from here.)
+        self.key.zeroize();
+    }
+}
+
 /// Handle to a running backed connection. Clonable; the actor stops when
 /// every clone is dropped (the command channel closing is a shutdown).
 #[derive(Clone)]

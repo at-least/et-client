@@ -9,10 +9,30 @@
 use crate::protocol::DEFAULT_TERMINAL;
 use et_proto::ids::{ID_LEN, PASSKEY_LEN};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdPasskey {
     pub id: String,
     pub passkey: String,
+}
+
+impl std::fmt::Debug for IdPasskey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The passkey is the session key; a derived Debug would print it
+        // straight into any log line that includes an IdPasskey.
+        f.debug_struct("IdPasskey")
+            .field("id", &self.id)
+            .field("passkey", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for IdPasskey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        // Defense-in-depth beyond upstream: scrub the strings on drop.
+        self.id.zeroize();
+        self.passkey.zeroize();
+    }
 }
 
 /// Marker the server-side `etterminal` prints on stdout (upstream
@@ -201,6 +221,18 @@ pub async fn run_ssh_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The passkey *is* the session key: a derived `Debug` would print it
+    /// straight into any log line that includes an `IdPasskey`.
+    #[test]
+    fn idpasskey_debug_does_not_leak_the_passkey() {
+        let ip = generate_id_passkey();
+        let rendered = format!("{ip:?}");
+        assert!(
+            !rendered.contains(&ip.passkey),
+            "Debug must redact the passkey, got: {rendered}"
+        );
+    }
 
     #[test]
     fn generated_ids_have_upstream_shape() {
