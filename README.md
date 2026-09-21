@@ -105,8 +105,10 @@ conch-core:
 - **Plain async API over plain data**: [`TerminalSession`](crates/et-client/src/session.rs)
   takes `(endpoint, id, passkey, InitialPayload, keepalive)` and yields
   `SessionEvent::TerminalBuffer / KeepAlive / Dead / Other`. No tokio types
-  leak across the boundary; reconnect, catch-up, buffering, and keepalive
-  enforcement are automatic inside the connection.
+  leak across the boundary — but the futures do run on a tokio runtime
+  (tasks and timers): embedders execute them inside any tokio context,
+  e.g. conch's own runtime behind UniFFI. Reconnect, catch-up, buffering,
+  and keepalive enforcement are automatic inside the connection.
 - Same dep hygiene as conch-core: wire-format deps pinned exact
   (`buffa`, `crypto_secretbox`), committed `Cargo.lock`, `thiserror`.
 

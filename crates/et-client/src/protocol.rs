@@ -1,10 +1,8 @@
 //! Client-side protocol constants that live upstream in `Headers.hpp` /
-//! `TerminalMain.cpp`.
+//! `TerminalMain.cpp`. The wire-length constants (`ID_LEN`, `PASSKEY_LEN`)
+//! live once in [`et_proto::ids`] — this module only adds client-side
+//! defaults.
 
-/// Length of the client id (`genRandomAlphaNum(16)`).
-pub const ID_LEN: usize = 16;
-/// Length of the passkey (`genRandomAlphaNum(32)`).
-pub const PASSKEY_LEN: usize = 32;
 /// `$TERM` used when the environment does not provide one (upstream default
 /// in `SshSetupHandler::SetupSsh`).
 pub const DEFAULT_TERMINAL: &str = "xterm-256color";

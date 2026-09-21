@@ -147,7 +147,6 @@ version = "0.1.0"
 dependencies = [
  "buffa",
  "et-proto",
- "getrandom 0.4.3",
  "thiserror",
  "tokio",
  "zeroize",

@@ -12,7 +12,10 @@ crypto_secretbox.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "sync", "time"] }
+# rt: the library itself spawns tasks (backed actor, engine, conn tasks);
+# listing it keeps the manifest an honest statement of what this crate
+# needs, instead of relying on additive workspace features to supply it.
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time"] }
 
 [dev-dependencies]
 # rt-multi-thread: the concurrent-drop test needs true worker parallelism.

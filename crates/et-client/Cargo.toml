@@ -10,7 +10,6 @@ description = "EternalTerminal client library: resilient encrypted terminal sess
 et-proto.workspace = true
 buffa.workspace = true
 thiserror.workspace = true
-getrandom.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
 
