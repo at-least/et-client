@@ -256,6 +256,53 @@ impl TerminalSession {
             || header == DESTINATION_RESPONSE_HEADER
     }
 
+    /// Hand one peer port-forward packet to the engine. Awaiting the
+    /// bounded queue is the backpressure path: while the engine is
+    /// saturated (a stalled local tunneled connection holds it in the
+    /// data path) the pump parks here, which backs up the supervisor, the
+    /// backed layer, and finally the ET socket itself. While parked, the
+    /// pump keeps draining the engine's *outbound* side — `reserve` (not
+    /// `send`) so the packet is never moved into a future the select
+    /// might drop — because only this pump drains outbound and only the
+    /// engine drains inbound; parking without draining would deadlock the
+    /// two queues against each other. A short tick aborts the park when
+    /// the session has died underneath it, so `next_event` cannot hang
+    /// behind a queue that will never drain; the parked packet is dropped
+    /// (the session is over either way).
+    async fn deliver_to_engine(&mut self, packet: Packet) {
+        let engine = match self.pf_inbound.as_ref() {
+            Some(handle) => handle,
+            None => return,
+        };
+        loop {
+            tokio::select! {
+                permit = engine.reserve() => match permit {
+                    Ok(permit) => {
+                        permit.send(packet);
+                        return;
+                    }
+                    Err(_) => return, // engine stopped: nothing to feed
+                },
+                frame = async {
+                    match self.pf_outbound.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match frame {
+                    Some(p) => {
+                        let _ = self.client.write(p.header(), p.into_payload()).await;
+                    }
+                    None => self.pf_outbound = None,
+                },
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if self.client.session_ended() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Next session event; `None` after the session ended. Port-forward
     /// frames (once [`TerminalSession::start_port_forwarding`] ran) are
     /// pumped to the engine and never surface here.
@@ -281,11 +328,18 @@ impl TerminalSession {
                 }
                 event = self.client.next_event() => match event? {
                     Event::Packet(packet) => {
-                        if Self::is_port_forward_header(packet.header()) {
-                            if let Some(inbound) = &self.pf_inbound {
-                                inbound.send(packet);
+                        if Self::is_port_forward_header(packet.header())
+                            && self.pf_inbound.is_some()
+                        {
+                            if self.client.session_ended() {
+                                // The session is over; port-forward packets
+                                // queued behind the terminal event are dead
+                                // weight — drop them instead of parking on
+                                // a saturated engine for each.
                                 continue;
                             }
+                            self.deliver_to_engine(packet).await;
+                            continue;
                         }
                         return Some(SessionEvent::from_packet(packet));
                     }
@@ -304,9 +358,10 @@ mod tests {
         read_framed_packet, read_proto_frame, write_framed_packet, write_proto_frame,
     };
     use et_proto::{
-        ConnectRequest, ConnectResponse, ConnectStatus, PortForwardDestinationRequest,
-        SocketEndpoint, CLIENT_SERVER_NONCE_MSB, MAX_HANDSHAKE_PROTO_LENGTH, MAX_PACKET_LENGTH,
-        PROTOCOL_VERSION, SERVER_CLIENT_NONCE_MSB,
+        ConnectRequest, ConnectResponse, ConnectStatus, PortForwardData,
+        PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
+        CLIENT_SERVER_NONCE_MSB, MAX_HANDSHAKE_PROTO_LENGTH, MAX_PACKET_LENGTH, PROTOCOL_VERSION,
+        SERVER_CLIENT_NONCE_MSB,
     };
     use std::sync::Arc;
     use tokio::net::TcpListener;
@@ -332,6 +387,10 @@ mod tests {
     struct Rig {
         peer: tokio::net::TcpStream,
         from_client: CryptoHandler,
+        to_client: CryptoHandler,
+        /// Still-bound handshake listener: a test can answer the
+        /// supervisor's reconnect attempts after dropping `peer`.
+        listener: Arc<TcpListener>,
     }
 
     impl Rig {
@@ -406,7 +465,35 @@ mod tests {
         .expect("the INITIAL exchange must complete");
 
         let session = timeout(LONG, session_rx).await.unwrap().unwrap().unwrap();
-        (session, Rig { peer, from_client })
+        (session, Rig {
+            peer,
+            from_client,
+            to_client,
+            listener,
+        })
+    }
+
+    /// Answers one supervisor reconnect handshake with `status`.
+    async fn answer_reconnect(listener: &TcpListener, status: ConnectStatus) {
+        let (mut peer, _) = timeout(LONG, listener.accept())
+            .await
+            .expect("the supervisor must reconnect")
+            .unwrap();
+        let bytes = timeout(
+            LONG,
+            read_proto_frame(&mut peer, MAX_HANDSHAKE_PROTO_LENGTH),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(ConnectRequest::decode_from_slice(&bytes).is_ok());
+        let response = ConnectResponse {
+            status: Some(status),
+            ..Default::default()
+        };
+        write_proto_frame(&mut peer, &response.encode_to_vec())
+            .await
+            .unwrap();
     }
 
     fn source_request(port: u16) -> PortForwardSourceRequest {
@@ -498,6 +585,358 @@ mod tests {
                 Ok(Ok(_conn)) => continue, // still up; recheck until the deadline
                 Ok(Err(_)) => break,       // refused: listener released
             }
+        }
+    }
+
+    /// A peer flooding port-forward data at a stalled local reverse-tunnel
+    /// destination must hit TCP backpressure: the engine wedges in the
+    /// data path, the bounded inbound queue fills, the session pump stops
+    /// reading — and the peer's own writes then stop completing instead of
+    /// being absorbed into client memory without bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pf_flood_backpressures_the_peer_socket() {
+        // The reverse-tunnel destination: accepts but never reads.
+        let service = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let service_port = service.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_sock, _) = service.accept().await.unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let destination = SocketEndpoint {
+            name: Some("127.0.0.1".into()),
+            port: Some(service_port as i32),
+            ..Default::default()
+        };
+        let payload = InitialPayload {
+            reversetunnels: vec![PortForwardSourceRequest {
+                destination: destination.clone().into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (mut session, mut rig) = start_session(&payload).await;
+        let driver = tokio::spawn(async move { while session.next_event().await.is_some() {} });
+
+        // The peer opens the destination; the engine answers with a socket.
+        let request = PortForwardDestinationRequest {
+            destination: destination.into(),
+            fd: Some(1),
+            ..Default::default()
+        };
+        let mut p = Packet::new(DESTINATION_REQUEST_HEADER, request.encode_to_vec());
+        p.encrypt(&mut rig.to_client);
+        write_framed_packet(&mut rig.peer, &p).await.unwrap();
+        let response = timeout(LONG, rig.read_client_packet()).await.unwrap();
+        assert_eq!(response.header(), DESTINATION_RESPONSE_HEADER);
+        let pf = PortForwardDestinationResponse::decode_from_slice(response.payload()).unwrap();
+        let socket_id = pf.socketid.expect("the destination opened");
+
+        // Flood 16 KiB data frames from the peer, counting delivered
+        // writes, until the socket closes.
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flood = {
+            let mut peer = rig.peer;
+            let mut to_client = rig.to_client;
+            let sent = sent.clone();
+            tokio::spawn(async move {
+                loop {
+                    let data = PortForwardData {
+                        sourcetodestination: Some(true),
+                        socketid: Some(socket_id),
+                        buffer: Some(vec![0u8; 16 * 1024]),
+                        ..Default::default()
+                    };
+                    let mut frame = Packet::new(PORT_FORWARD_HEADER, data.encode_to_vec());
+                    frame.encrypt(&mut to_client);
+                    if write_framed_packet(&mut peer, &frame).await.is_err() {
+                        break;
+                    }
+                    sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+
+        // The flood must stabilize at the bounded queues (several thousand
+        // frames of capacity fill first): sample until three consecutive
+        // reads are flat. An unbounded path keeps draining the socket at
+        // line rate and the count never stabilizes.
+        let mut prev = 0usize;
+        let mut flat_streak = 0;
+        let froze_at = 'stable: {
+            for _ in 0..80 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let now = sent.load(std::sync::atomic::Ordering::Relaxed);
+                if now <= prev + 2 {
+                    flat_streak += 1;
+                    if flat_streak == 3 {
+                        break 'stable Some(now);
+                    }
+                } else {
+                    flat_streak = 0;
+                }
+                prev = now;
+            }
+            None
+        };
+        froze_at.expect("the peer must hit TCP backpressure once the queues fill");
+
+        driver.abort();
+        flood.abort();
+    }
+
+    /// A session pump under sustained inbound port-forward load must keep
+    /// draining the engine's *outbound* side: only the pump drains
+    /// outbound and only the engine drains inbound, so a pump that parks
+    /// on a full inbound queue without draining can wedge the pair (the
+    /// engine parks on a full outbound queue in the same window). The
+    /// mutual park is race-dependent, so this test pins the observable
+    /// contract — reverse-tunnel data keeps flowing under sustained
+    /// inbound congestion — rather than one interleaving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_pump_drains_outbound_while_parked_on_a_full_inbound() {
+        // A ticker destination: pushes bytes to the engine's local side
+        // unsolicited, so its traffic rides the engine→peer outbound path.
+        let ticker = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let ticker_port = ticker.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            let (mut stream, _) = ticker.accept().await.unwrap();
+            let mut i = 0u64;
+            loop {
+                if stream
+                    .write_all(format!("tick{i};").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                i += 1;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        let payload = InitialPayload {
+            reversetunnels: vec![PortForwardSourceRequest::default()],
+            ..Default::default()
+        };
+        let (mut session, mut rig) = start_session(&payload).await;
+        // The embedder does NOT poll yet — the pump is not running.
+
+        let request = PortForwardDestinationRequest {
+            destination: SocketEndpoint {
+                name: Some("127.0.0.1".into()),
+                port: Some(ticker_port as i32),
+                ..Default::default()
+            }
+            .into(),
+            fd: Some(1),
+            ..Default::default()
+        };
+        let mut p = Packet::new(DESTINATION_REQUEST_HEADER, request.encode_to_vec());
+        p.encrypt(&mut rig.to_client);
+        write_framed_packet(&mut rig.peer, &p).await.unwrap();
+        // Drive the pump only long enough for the open round trip, then
+        // stop polling (the response returns to the peer over the wire).
+        let response = timeout(LONG, async {
+            loop {
+                tokio::select! {
+                    event = session.next_event() => {
+                        assert!(event.is_some(), "the session must stay alive");
+                    }
+                    response = rig.read_client_packet() => break response,
+                }
+            }
+        })
+        .await
+        .expect("the destination must open");
+        let pf = PortForwardDestinationResponse::decode_from_slice(response.payload()).unwrap();
+        let ticker_id = pf.socketid.expect("the ticker destination opened");
+
+        // Split the peer socket: the flood task writes; a reader task
+        // counts ticker bytes coming back from the client.
+        let (mut read_half, write_half) = rig.peer.into_split();
+        let ticker_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = {
+            let ticker_bytes = ticker_bytes.clone();
+            tokio::spawn(async move {
+                let mut from_client = rig.from_client;
+                loop {
+                    match read_framed_packet(&mut read_half, MAX_PACKET_LENGTH).await {
+                        Ok(mut packet) => {
+                            if packet.is_encrypted() && packet.decrypt(&mut from_client).is_ok() {
+                                if let Ok(data) =
+                                    PortForwardData::decode_from_slice(packet.payload())
+                                {
+                                    if data.socketid == Some(ticker_id) {
+                                        ticker_bytes.fetch_add(
+                                            data.buffer.map(|b| b.len()).unwrap_or(0),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+        };
+
+        // Phase 1 — the ticker fills the engine's outbound queue; with no
+        // pump running, the engine parks on its outbound send.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Phase 2 — a sustained inbound flood of frames for an unknown
+        // socket id (the engine drops them silently once it consumes
+        // them, so the flood pressures the queues without wedging any
+        // local connection). The flood holds the peer's write half for
+        // its whole life: dropping it would EOF the client's read side
+        // and kill the ET socket.
+        let flood = {
+            let mut to_client = rig.to_client;
+            tokio::spawn(async move {
+                let mut peer = write_half;
+                loop {
+                    let data = PortForwardData {
+                        sourcetodestination: Some(true),
+                        socketid: Some(9999),
+                        buffer: Some(vec![0u8; 8]),
+                        ..Default::default()
+                    };
+                    let mut frame = Packet::new(PORT_FORWARD_HEADER, data.encode_to_vec());
+                    frame.encrypt(&mut to_client);
+                    if write_framed_packet(&mut peer, &frame).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        // Phase 3 — the embedder resumes polling under sustained inbound
+        // congestion; the ticker's reverse data must keep flowing for as
+        // long as the session lives (sampled late, past any startup
+        // burst, and again after a further window).
+        let driver = tokio::spawn(async move { while session.next_event().await.is_some() {} });
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let first = ticker_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(first > 100, "reverse data must flow under congestion: {first}");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let second = ticker_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            second > first + 100,
+            "reverse data must keep flowing under sustained congestion \
+             (ticker bytes {first} → {second})"
+        );
+
+        driver.abort();
+        flood.abort();
+        reader.abort();
+    }
+
+    /// A pump parked on a saturated engine (a stalled local tunneled
+    /// connection) must not swallow the session's death: when the session
+    /// ends underneath the park, `next_event` must surface the terminal
+    /// event instead of hanging behind an inbound queue that will never
+    /// drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_parked_pump_surfaces_the_sessions_death() {
+        // The stalled destination: accepts but never reads.
+        let stalled = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let stalled_port = stalled.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_sock, _) = stalled.accept().await.unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let payload = InitialPayload {
+            reversetunnels: vec![PortForwardSourceRequest::default()],
+            ..Default::default()
+        };
+        let (mut session, mut rig) = start_session(&payload).await;
+
+        let request = PortForwardDestinationRequest {
+            destination: SocketEndpoint {
+                name: Some("127.0.0.1".into()),
+                port: Some(stalled_port as i32),
+                ..Default::default()
+            }
+            .into(),
+            fd: Some(1),
+            ..Default::default()
+        };
+        let mut p = Packet::new(DESTINATION_REQUEST_HEADER, request.encode_to_vec());
+        p.encrypt(&mut rig.to_client);
+        write_framed_packet(&mut rig.peer, &p).await.unwrap();
+        // Drive the pump only long enough for the open round trip.
+        let response = timeout(LONG, async {
+            loop {
+                tokio::select! {
+                    event = session.next_event() => {
+                        assert!(event.is_some(), "the session must stay alive");
+                    }
+                    response = rig.read_client_packet() => break response,
+                }
+            }
+        })
+        .await
+        .expect("the destination must open");
+        let pf = PortForwardDestinationResponse::decode_from_slice(response.payload()).unwrap();
+        let stalled_id = pf.socketid.expect("the stalled destination opened");
+
+        // Flood the stalled destination with 64 KiB frames until the
+        // engine wedges in the data path and the pump parks on the full
+        // inbound queue: big frames minimize kernel absorption (~2-4
+        // frames) so the wedge is deterministic while the session's own
+        // event chain stays well below its capacity — the death must stay
+        // routable through it. The pump runs alongside; when the flood
+        // task finishes, dropping the peer's write half kills the ET
+        // socket (the supervisor reconnects; the mock answers NEW_CLIENT —
+        // the terminal ServerStateLost path).
+        let (_read_half, write_half) = rig.peer.into_split();
+        let mut to_client = rig.to_client;
+        let flood = tokio::spawn(async move {
+            let mut peer = write_half;
+            for _ in 0..700 {
+                let data = PortForwardData {
+                    sourcetodestination: Some(true),
+                    socketid: Some(stalled_id),
+                    buffer: Some(vec![0u8; 64 * 1024]),
+                    ..Default::default()
+                };
+                let mut frame = Packet::new(PORT_FORWARD_HEADER, data.encode_to_vec());
+                frame.encrypt(&mut to_client);
+                if write_framed_packet(&mut peer, &frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut flood = flood;
+        timeout(LONG * 4, async {
+            loop {
+                tokio::select! {
+                    event = session.next_event() => {
+                        assert!(event.is_some(), "the session must stay alive");
+                    }
+                    done = &mut flood => {
+                        let _ = done;
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the flood must complete");
+
+        answer_reconnect(&rig.listener, ConnectStatus::NewClient).await;
+
+        match timeout(Duration::from_secs(8), session.next_event()).await {
+            Ok(Some(SessionEvent::Dead(ClientDeadReason::ServerStateLost))) => {}
+            other => panic!("the parked pump must surface the death, got {other:?}"),
         }
     }
 }

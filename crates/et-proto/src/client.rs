@@ -289,6 +289,14 @@ impl EtClient {
     pub async fn next_event(&mut self) -> Option<Event> {
         self.events_rx.recv().await
     }
+
+    /// Whether the session's event stream has ended (the supervisor is
+    /// gone). A parkable consumer — the port-forward pump waiting on a
+    /// saturated engine — polls this so a dead session cannot hang it
+    /// behind a queue that will never drain.
+    pub fn session_ended(&self) -> bool {
+        self.events_rx.is_closed()
+    }
 }
 
 /// Upstream asserts `key.length() == crypto_secretbox_KEYBYTES`: the

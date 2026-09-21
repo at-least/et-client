@@ -59,6 +59,13 @@ pub const RECOVER_ABSOLUTE: Duration = Duration::from_secs(60);
 /// Recover-exchange IO chunk: each chunk must complete within one
 /// [`RECOVER_STEP_IDLE`] window (~6.5 KiB/s minimum sustainable rate).
 const RECOVER_IO_CHUNK: usize = 64 * 1024;
+/// Bound on delivering a terminal `Dead` event: a stalled consumer (a
+/// normal state once port-forward backpressure engages) must not keep a
+/// dying actor alive. If the bound hits, the *reason* is lost — the
+/// channel close right after still ends the session (the owner sees
+/// `next_event() == None` rather than `Dead(reason)`) — but the actor is
+/// never held hostage by consumer progress.
+const DEAD_SEND_BOUND: Duration = Duration::from_secs(1);
 const WRITE_QUEUE_DEPTH: usize = 1024;
 const EVENT_QUEUE_DEPTH: usize = 1024;
 
@@ -81,7 +88,7 @@ pub enum DeadReason {
     CryptoMismatch,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BackedEvent {
     /// A decrypted packet, in order (catch-up first).
     Packet(Packet),
@@ -313,22 +320,9 @@ impl BackedActor {
 
         loop {
             tokio::select! {
-                cmd = cmd_rx.recv() => match cmd {
-                    Some(Cmd::Write { header, payload, reply }) => {
-                        let result = self.write(header, payload).await;
-                        let _ = reply.send(result);
-                    }
-                    Some(Cmd::KillSocket) => self.close_current_socket(),
-                    Some(Cmd::Recover { stream, reply, idle, absolute }) => {
-                        let ok = self.recover_timed_actor(stream, idle, absolute).await;
-                        let _ = reply.send(ok);
-                    }
-                    // Channel closed: every handle was dropped.
-                    Some(Cmd::Shutdown) | None => {
-                        self.shutting_down = true;
-                        break;
-                    }
-                },
+                cmd = cmd_rx.recv() => {
+                    self.handle_cmd(cmd).await;
+                }
                 frame = async {
                     match self.live.as_mut() {
                         Some(live) => live.io_rx.recv().await,
@@ -346,11 +340,11 @@ impl BackedActor {
             }
             if self.socket_down_pending {
                 self.socket_down_pending = false;
-                if self.events_tx.send(BackedEvent::SocketDown).await.is_err() {
+                if !self.send_event(BackedEvent::SocketDown, &mut cmd_rx).await {
                     break;
                 }
             }
-            self.deliver_inbox().await;
+            self.deliver_inbox(&mut cmd_rx).await;
             if self.shutting_down {
                 break;
             }
@@ -360,10 +354,62 @@ impl BackedActor {
             live.io_rx.close();
         }
         if !self.dead_sent {
-            let _ = self
-                .events_tx
-                .send(BackedEvent::Dead(DeadReason::Shutdown))
-                .await;
+            // Bounded (see DEAD_SEND_BOUND): a stalled consumer must not
+            // keep the dying actor alive.
+            let _ = tokio::time::timeout(
+                DEAD_SEND_BOUND,
+                self.events_tx.send(BackedEvent::Dead(DeadReason::Shutdown)),
+            )
+            .await;
+        }
+    }
+
+    /// One command off the queue (`None` = every handle dropped, a
+    /// shutdown). Sets `shutting_down` on the terminal commands.
+    async fn handle_cmd(&mut self, cmd: Option<Cmd>) {
+        match cmd {
+            Some(Cmd::Write { header, payload, reply }) => {
+                let result = self.write(header, payload).await;
+                let _ = reply.send(result);
+            }
+            Some(Cmd::KillSocket) => self.close_current_socket(),
+            Some(Cmd::Recover { stream, reply, idle, absolute }) => {
+                let ok = self.recover_timed_actor(stream, idle, absolute).await;
+                let _ = reply.send(ok);
+            }
+            Some(Cmd::Shutdown) | None => {
+                self.shutting_down = true;
+            }
+        }
+    }
+
+    /// Delivers `event` to the consumer without ever freezing command
+    /// processing on consumer progress: once port-forward backpressure can
+    /// stall the session pump, a full event queue is a normal operating
+    /// state, and the actor must keep serving writes and recovery through
+    /// it (the write path already never blocks on socket progress;
+    /// consumer progress gets the same guarantee). Timer-driven keepalive
+    /// is deliberately suspended while parked here — congestion means the
+    /// peer is demonstrably still sending; a link that dies *during* a
+    /// stall is detected when the stall clears or the write path kills a
+    /// full socket. Returns false when the consumer is gone or a drained
+    /// command ended the session.
+    async fn send_event(&mut self, event: BackedEvent, cmd_rx: &mut mpsc::Receiver<Cmd>) -> bool {
+        loop {
+            // Unbiased, like the engine's data-path select: commands get
+            // served during a stall, but a steady stream of them must not
+            // starve event delivery entirely.
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    self.handle_cmd(cmd).await;
+                    if self.shutting_down {
+                        return false;
+                    }
+                }
+                sent = self.events_tx.send(event.clone()) => {
+                    return sent.is_ok();
+                }
+            }
         }
     }
 
@@ -373,13 +419,14 @@ impl BackedActor {
     async fn die_crypto_mismatch(&mut self) {
         self.shutting_down = true;
         self.dead_sent = true;
-        let _ = self
-            .events_tx
-            .send(BackedEvent::Dead(DeadReason::CryptoMismatch))
-            .await;
+        let _ = tokio::time::timeout(
+            DEAD_SEND_BOUND,
+            self.events_tx.send(BackedEvent::Dead(DeadReason::CryptoMismatch)),
+        )
+        .await;
     }
 
-    async fn deliver_inbox(&mut self) {
+    async fn deliver_inbox(&mut self, cmd_rx: &mut mpsc::Receiver<Cmd>) {
         while let Some(bytes) = self.inbox.pop_front() {
             // A frame that fails to parse is protocol corruption: skipping
             // it without advancing the reader sequence would desynchronize
@@ -411,12 +458,7 @@ impl BackedActor {
                 self.waiting_on_keepalive = false;
             }
             self.reader_seq += 1;
-            if self
-                .events_tx
-                .send(BackedEvent::Packet(packet))
-                .await
-                .is_err()
-            {
+            if !self.send_event(BackedEvent::Packet(packet), cmd_rx).await {
                 return;
             }
         }
@@ -1188,6 +1230,33 @@ mod tests {
             Err(WriteError::Shutdown)
         );
         assert!(rig.events.recv().await.is_none());
+    }
+
+    /// The actor must keep serving commands while its event consumer
+    /// stalls: with port-forward backpressure in the session layer, a full
+    /// event queue is a *normal* operating state, and freezing command
+    /// processing inside delivery would deadlock the session pump's own
+    /// writes and keepalive enforcement along with it.
+    #[tokio::test]
+    async fn commands_are_served_while_the_event_consumer_stalls() {
+        let rig = rig(None).await;
+        let mut peer = rig.accept().await;
+        let mut pc = peer_crypto();
+
+        // Overfill the 1024-deep event queue: packets the test never
+        // receives, so the actor runs out of delivery capacity.
+        for i in 0..1100u16 {
+            send_peer_packet(&mut peer, &mut pc.writer, 1, &[i as u8; 64]).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The socket is alive: a write command must still be served —
+        // its reply comes from the actor, which must not be wedged inside
+        // event delivery.
+        match timeout(LONG, rig.backed.write(7, b"cmd".to_vec())).await {
+            Ok(Ok(())) => {}
+            other => panic!("write must be served while events back up, got {other:?}"),
+        }
     }
 
     /// Dropping every handle is a shutdown: the actor drains, reports

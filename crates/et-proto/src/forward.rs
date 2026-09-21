@@ -239,13 +239,19 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// `TcpStream` plus two tasks, and the peer decides how many to open —
 /// every other engine resource is bounded, so this one is too.
 const MAX_DESTINATION_CONNECTIONS: usize = 256;
+/// Inbound (session pump → engine) queue depth: the pump's `send` blocks
+/// here while the engine is wedged in the data path (a stalled local
+/// tunneled connection), which is the backpressure that propagates through
+/// the session pump to the ET socket — upstream's synchronous reader got
+/// the same effect from the kernel. Bounded like every other stage.
+const INBOUND_QUEUE_DEPTH: usize = 256;
 
 /// A running engine. Feed it the peer's port-forward packets; it emits the
 /// frames to write back to the session. The engine stops — listeners
 /// released, connections torn down, outbound closed — on [`shutdown`]
 /// (EngineHandle::shutdown) or when every handle clone is dropped.
 pub struct EngineHandle {
-    inbound: mpsc::UnboundedSender<Packet>,
+    inbound: mpsc::Sender<Packet>,
     cmd_tx: mpsc::Sender<Cmd>,
     shutdown_tx: watch::Sender<bool>,
     /// Live handle-clone count; the Drop impl raises the shutdown watch on
@@ -280,7 +286,7 @@ impl EngineHandle {
         sources: Vec<PortForwardSourceRequest>,
         answer_destinations: bool,
     ) -> (EngineHandle, mpsc::Receiver<Packet>, Vec<String>) {
-        let (inbound, inbound_rx) = mpsc::unbounded_channel();
+        let (inbound, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
         let (outbound, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_DEPTH);
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (events_tx, events) = mpsc::channel(EVENT_QUEUE_DEPTH);
@@ -314,8 +320,23 @@ impl EngineHandle {
         )
     }
 
-    pub fn send(&self, packet: Packet) {
-        let _ = self.inbound.send(packet);
+    /// Feed the engine one of the peer's port-forward packets. Awaits the
+    /// engine's acceptance: the inbound queue is bounded, so while the
+    /// engine is saturated (a stalled local tunneled connection holds it
+    /// in the data path) this blocks — the backpressure that propagates to
+    /// the session pump and, through it, to the ET socket.
+    pub async fn send(&self, packet: Packet) {
+        let _ = self.inbound.send(packet).await;
+    }
+
+    /// Reserve a slot in the bounded inbound queue — the cancel-safe form
+    /// of [`EngineHandle::send`]: the caller parks on the *permit*, not on
+    /// a future that owns the packet, so a `select!` that drops this
+    /// future loses nothing. `Err` means the engine has stopped.
+    pub async fn reserve(
+        &self,
+    ) -> Result<mpsc::Permit<'_, Packet>, mpsc::error::SendError<()>> {
+        self.inbound.reserve().await
     }
 
     /// Stops the engine: source listeners are released, every tunneled
@@ -880,7 +901,7 @@ async fn send_or_shutdown(
 
 /// The engine task's channel endpoints.
 struct EngineChannels {
-    inbound: mpsc::UnboundedReceiver<Packet>,
+    inbound: mpsc::Receiver<Packet>,
     cmd_rx: mpsc::Receiver<Cmd>,
     outbound: mpsc::Sender<Packet>,
     events: mpsc::Receiver<Event>,
@@ -1242,6 +1263,28 @@ mod tests {
             .expect("the engine task died")
     }
 
+    /// Pumps bulk 16 KiB frames into the engine from its own task: with the
+    /// bounded inbound queue the sender blocks once the engine wedges, so
+    /// the test body itself must not be the pumper. The feeder holds a
+    /// handle clone — abort it before relying on last-handle-drop semantics.
+    fn spawn_bulk_feeder(
+        handle: &EngineHandle,
+        socket_ids: &[i32],
+        rounds: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        let handle = handle.clone();
+        let socket_ids = socket_ids.to_vec();
+        tokio::spawn(async move {
+            for _ in 0..rounds {
+                for &socket_id in &socket_ids {
+                    handle
+                        .send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false))
+                        .await;
+                }
+            }
+        })
+    }
+
     /// Echo server on an ephemeral 127.0.0.1 port.
     async fn spawn_echo() -> u16 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1449,15 +1492,13 @@ mod tests {
         });
 
         let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
-        handle.send(destination_request(1, service_port));
+        handle.send(destination_request(1, service_port)).await;
         let response = PortForwardDestinationResponse::decode_from_slice(
             next_outbound(&mut outbound).await.payload(),
         )
         .unwrap();
         let socket_id = response.socketid.expect("the destination opened");
-        for _ in 0..1024 {
-            handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
-        }
+        let _feeder = spawn_bulk_feeder(&handle, &[socket_id], 1024);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let port = {
@@ -1492,15 +1533,13 @@ mod tests {
         });
 
         let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
-        handle.send(destination_request(1, service_port));
+        handle.send(destination_request(1, service_port)).await;
         let response = PortForwardDestinationResponse::decode_from_slice(
             next_outbound(&mut outbound).await.payload(),
         )
         .unwrap();
         let socket_id = response.socketid.expect("the destination opened");
-        for _ in 0..1024 {
-            handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
-        }
+        let _feeder = spawn_bulk_feeder(&handle, &[socket_id], 1024);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Fill the 16-deep command queue and then some; every call must
@@ -1541,15 +1580,13 @@ mod tests {
         });
 
         let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
-        handle.send(destination_request(1, service_port));
+        handle.send(destination_request(1, service_port)).await;
         let response = PortForwardDestinationResponse::decode_from_slice(
             next_outbound(&mut outbound).await.payload(),
         )
         .unwrap();
         let socket_id = response.socketid.expect("the destination opened");
-        for _ in 0..1024 {
-            handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
-        }
+        let _feeder = spawn_bulk_feeder(&handle, &[socket_id], 1024);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let waiting = tokio::spawn({
@@ -1580,7 +1617,7 @@ mod tests {
     async fn destination_requests_are_refused_when_not_enabled() {
         let (handle, mut outbound, errors) = EngineHandle::spawn(Vec::new(), false).await;
         assert!(errors.is_empty());
-        handle.send(destination_request(7, 1));
+        handle.send(destination_request(7, 1)).await;
         let response = PortForwardDestinationResponse::decode_from_slice(
             next_outbound(&mut outbound).await.payload(),
         )
@@ -1600,7 +1637,7 @@ mod tests {
             listener.local_addr().unwrap().port()
         };
         let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
-        handle.send(destination_request(3, port));
+        handle.send(destination_request(3, port)).await;
         let response = PortForwardDestinationResponse::decode_from_slice(
             next_outbound(&mut outbound).await.payload(),
         )
@@ -1616,7 +1653,7 @@ mod tests {
     #[tokio::test]
     async fn destination_requests_with_out_of_range_ports_are_refused() {
         let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
-        handle.send(destination_request_i32(3, 70000));
+        handle.send(destination_request_i32(3, 70000)).await;
         let response = PortForwardDestinationResponse::decode_from_slice(
             next_outbound(&mut outbound).await.payload(),
         )
@@ -1635,7 +1672,7 @@ mod tests {
         let echo_port = spawn_echo().await;
         let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
 
-        handle.send(destination_request(1, echo_port));
+        handle.send(destination_request(1, echo_port)).await;
         let response = PortForwardDestinationResponse::decode_from_slice(
             next_outbound(&mut outbound).await.payload(),
         )
@@ -1644,7 +1681,7 @@ mod tests {
         assert!(response.error.is_none());
         let socket_id = response.socketid.expect("the destination opened");
 
-        handle.send(pf_frame(socket_id, true, b"ping", false));
+        handle.send(pf_frame(socket_id, true, b"ping", false)).await;
         let back = PortForwardData::decode_from_slice(next_outbound(&mut outbound).await.payload())
             .unwrap();
         assert_eq!(back.socketid, Some(socket_id));
@@ -1658,8 +1695,8 @@ mod tests {
         // The peer's close tears the tunnel down locally — no close frame is
         // mirrored for a socket we still track (that mirror is only for
         // unknown sockets) — and data for the dead id is dropped silently.
-        handle.send(pf_frame(socket_id, true, b"", true));
-        handle.send(pf_frame(socket_id, true, b"late", false));
+        handle.send(pf_frame(socket_id, true, b"", true)).await;
+        handle.send(pf_frame(socket_id, true, b"late", false)).await;
         assert!(
             timeout(Duration::from_millis(300), outbound.recv())
                 .await
@@ -1678,7 +1715,7 @@ mod tests {
         let echo_port = spawn_echo().await;
         let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
         for i in 0..MAX_DESTINATION_CONNECTIONS {
-            handle.send(destination_request(i as i32 + 1, echo_port));
+            handle.send(destination_request(i as i32 + 1, echo_port)).await;
             let response = PortForwardDestinationResponse::decode_from_slice(
                 next_outbound(&mut outbound).await.payload(),
             )
@@ -1687,7 +1724,7 @@ mod tests {
             assert!(response.socketid.is_some(), "within the cap, got {response:?}");
         }
 
-        handle.send(destination_request(9999, echo_port));
+        handle.send(destination_request(9999, echo_port)).await;
         let response = PortForwardDestinationResponse::decode_from_slice(
             next_outbound(&mut outbound).await.payload(),
         )
@@ -1696,6 +1733,49 @@ mod tests {
         assert!(response.socketid.is_none(), "beyond the cap, got {response:?}");
         let error = response.error.expect("a cap refusal reason");
         assert!(error.contains("too many"), "{error}");
+    }
+
+    /// The inbound queue is bounded: while the engine is wedged in the
+    /// data path (a stalled local tunneled connection), further `send`s
+    /// block — that backpressure is what reaches the session pump and the
+    /// ET socket — and shutdown releases the blocked senders.
+    #[tokio::test]
+    async fn inbound_send_blocks_while_the_engine_is_wedged() {
+        let service = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let service_port = service.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_sock, _) = service.accept().await.unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
+        handle.send(destination_request(1, service_port)).await;
+        let response = PortForwardDestinationResponse::decode_from_slice(
+            next_outbound(&mut outbound).await.payload(),
+        )
+        .unwrap();
+        let socket_id = response.socketid.expect("the destination opened");
+
+        let feeder = spawn_bulk_feeder(&handle, &[socket_id], 4096);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The engine is wedged and the inbound queue is full: one more
+        // send must not complete within a generous window.
+        assert!(
+            timeout(
+                Duration::from_millis(300),
+                handle.send(pf_frame(socket_id, true, b"x", false)),
+            )
+            .await
+            .is_err(),
+            "send must block while the engine is wedged (backpressure), not buffer without bound"
+        );
+
+        // Shutdown releases the blocked senders (as errors) and the engine.
+        handle.shutdown().await;
+        let _ = feeder.await;
     }
 
     /// Frames for a socket we do not track are dropped silently — the
@@ -1707,8 +1787,8 @@ mod tests {
     async fn closes_for_unknown_sockets_are_dropped() {
         let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
         for flag in [true, false] {
-            handle.send(pf_frame(999, flag, b"", true));
-            handle.send(pf_frame(999, flag, b"data", false));
+            handle.send(pf_frame(999, flag, b"", true)).await;
+            handle.send(pf_frame(999, flag, b"data", false)).await;
         }
         assert!(
             timeout(Duration::from_millis(300), outbound.recv())
@@ -1738,7 +1818,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_secs(3600)).await;
                 }
             });
-            handle.send(destination_request(i + 1, service_port));
+            handle.send(destination_request(i + 1, service_port)).await;
             let response = PortForwardDestinationResponse::decode_from_slice(
                 next_outbound(&mut outbound).await.payload(),
             )
@@ -1748,11 +1828,7 @@ mod tests {
 
         // 2048 × 16 KiB = 32 MiB interleaved: past kernel buffers and both
         // 256-frame queues, so the engine blocks in the data path twice.
-        for _ in 0..1024 {
-            for &socket_id in &socket_ids {
-                handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
-            }
-        }
+        let _feeder = spawn_bulk_feeder(&handle, &socket_ids, 1024);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         timeout(Duration::from_secs(2), handle.shutdown())
@@ -1783,17 +1859,16 @@ mod tests {
         });
 
         let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
-        handle.send(destination_request(1, service_port));
+        handle.send(destination_request(1, service_port)).await;
         let response = PortForwardDestinationResponse::decode_from_slice(
             next_outbound(&mut outbound).await.payload(),
         )
         .unwrap();
         let socket_id = response.socketid.expect("the destination opened");
 
-        for _ in 0..1024 {
-            handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
-        }
+        let feeder = spawn_bulk_feeder(&handle, &[socket_id], 1024);
         tokio::time::sleep(Duration::from_millis(300)).await;
+        feeder.abort(); // release the feeder's clone: `handle` is the last one
 
         drop(handle);
         let drained = timeout(Duration::from_secs(2), async {
@@ -1825,16 +1900,15 @@ mod tests {
         });
 
         let (handle, mut outbound, _) = EngineHandle::spawn(Vec::new(), true).await;
-        handle.send(destination_request(1, service_port));
+        handle.send(destination_request(1, service_port)).await;
         let response = PortForwardDestinationResponse::decode_from_slice(
             next_outbound(&mut outbound).await.payload(),
         )
         .unwrap();
         let socket_id = response.socketid.expect("the destination opened");
-        for _ in 0..1024 {
-            handle.send(pf_frame(socket_id, true, &[0u8; 16 * 1024], false));
-        }
+        let feeder = spawn_bulk_feeder(&handle, &[socket_id], 1024);
         tokio::time::sleep(Duration::from_millis(300)).await;
+        feeder.abort(); // release the feeder's clone: the 8 below are the last
 
         // Eight clones, all released at one barrier and dropped at once;
         // the original handle is already gone, so these are the last ones.
