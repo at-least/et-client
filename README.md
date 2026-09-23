@@ -1,3 +1,7 @@
+> **FROZEN 2026-09-24** — this library now lives in the conch monorepo
+> (`shared/et-client`, full history preserved via git subtree). This
+> standalone repo is archived; no further work happens here.
+
 # et-client — EternalTerminal client library (Rust, wire-compatible)
 
 A Rust client library for [EternalTerminal](https://github.com/MisterTea/EternalTerminal)
