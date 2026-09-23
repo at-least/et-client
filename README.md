@@ -1,5 +1,5 @@
 > **FROZEN 2026-09-24** — this library now lives in the conch monorepo
-> (`shared/et-client`, full history preserved via git subtree). This
+> (`shared/et_client` — underscores since the 2026-09-24 rename, full history preserved via git subtree). This
 > standalone repo is archived; no further work happens here.
 
 # et-client — EternalTerminal client library (Rust, wire-compatible)
